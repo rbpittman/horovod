@@ -67,6 +67,9 @@ const std::string& MPIRequest::RequestType_Name(RequestType value) {
   case RequestType::BROADCAST:
     static const std::string broadcast("BROADCAST");
     return broadcast;
+  case RequestType::GATHER:
+    static const std::string gather("GATHER");
+    return gather;
   default:
     static const std::string unknown("<unknown>");
     return unknown;
@@ -166,6 +169,9 @@ const std::string& MPIResponse::ResponseType_Name(ResponseType value) {
   case ResponseType::SHUTDOWN:
     static const std::string shutdown("SHUTDOWN");
     return shutdown;
+  case ResponseType::GATHER:
+    static const std::string gather("GATHER");
+    return gather;
   default:
     static const std::string unknown("<unknown>");
     return unknown;

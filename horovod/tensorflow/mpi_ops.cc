@@ -310,6 +310,9 @@ MPIResponse ConstructMPIResponse(std::unique_ptr<MessageTable>& message_table,
 
   // If we are doing an allreduce or broadcast, check that all tensor shapes are
   // identical.
+  // rbpittma: For allgather, they do not need this since gathering
+  // can have a changing first dimension size, while reducing requires
+  // all same shape. 
   if (message_type == MPIRequest::ALLREDUCE ||
       message_type == MPIRequest::BROADCAST) {
     TensorShape tensor_shape;
@@ -339,18 +342,19 @@ MPIResponse ConstructMPIResponse(std::unique_ptr<MessageTable>& message_table,
       }
     }
   }
-
-  // If we are doing an allgather, make sure all but the first dimension are
+  
+  // If we are doing an allgather (or gather), make sure all but the first dimension are
   // the same. The first dimension may be different and the output tensor is
   // the sum of the first dimension. Collect the sizes by rank.
   std::vector<size_t> tensor_sizes(requests.size());
-  if (message_type == MPIRequest::ALLGATHER) {
+  if (message_type == MPIRequest::ALLGATHER ||
+      message_type == MPIRequest::GATHER) {
     TensorShape tensor_shape;
     for (auto it = requests[0].tensor_shape().begin();
          it != requests[0].tensor_shape().end(); it++) {
       tensor_shape.AddDim(*it);
     }
-
+    
     if (tensor_shape.dims() == 0) {
       error = true;
       error_message_stream << "Rank zero tried to "
@@ -405,8 +409,9 @@ MPIResponse ConstructMPIResponse(std::unique_ptr<MessageTable>& message_table,
     }
   }
 
-  // If we are doing a broadcast, check that all root ranks are identical.
-  if (message_type == MPIRequest::BROADCAST) {
+  // If we are doing a broadcast (or gather), check that all root ranks are identical.
+  if (message_type == MPIRequest::BROADCAST ||
+      message_type == MPIRequest::GATHER) {
     int first_root_rank = requests[0].root_rank();
     for (unsigned int i = 1; i < requests.size(); i++) {
       if (error) {
@@ -457,6 +462,11 @@ MPIResponse ConstructMPIResponse(std::unique_ptr<MessageTable>& message_table,
     response.set_error_message(error_message);
   } else if (message_type == MPIRequest::ALLGATHER) {
     response.set_response_type(MPIResponse::ALLGATHER);
+    for (auto dim : tensor_sizes) {
+      response.add_tensor_sizes(dim);
+    }
+  } else if (message_type == MPIRequest::GATHER) {
+    response.set_response_type(MPIResponse::GATHER);
     for (auto dim : tensor_sizes) {
       response.add_tensor_sizes(dim);
     }
@@ -652,6 +662,7 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
 
       assert(response.response_type() == MPIResponse::ALLREDUCE ||
              response.response_type() == MPIResponse::ALLGATHER ||
+             response.response_type() == MPIResponse::GATHER    ||
              response.response_type() == MPIResponse::BROADCAST ||
              response.response_type() == MPIResponse::ERROR);
 
@@ -746,7 +757,7 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
       tensor_sizes.push_back(size_t(*it));
       total_dimension_size += size_t(*it);
     }
-
+    
     // Every tensor participating in Allgather operation may have different
     // first dimension size, but the rest of dimensions are same for all
     // tensors.  Here we get shape of tensor sliced by first dimension.
@@ -785,7 +796,7 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
     }
 #endif
     ACTIVITY_END_ALL(entries, timeline)
-
+    
     // Tensors may have different first dimension, so we need to use
     // MPI_Allgatherv API that supports gathering arrays of different length.
     ACTIVITY_START_ALL(entries, timeline, "MPI_ALLGATHER")
@@ -809,6 +820,99 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response) {
     MPI_CHECK(entries, "MPI_Allgatherv", result)
     ACTIVITY_END_ALL(entries, timeline)
 
+    timeline.End(e.tensor_name, e.output);
+    e.callback(Status::OK());
+    
+  } else if (response.response_type() == MPIResponse::GATHER) {
+    assert(entries.size() == 1);
+    auto e = entries[0];
+    // Copy tensor sizes from the MPI response into a vector of size_t
+    // and compute total size.  This is size of first dimension.
+    std::vector<size_t> tensor_sizes;
+    size_t total_dimension_size = 0;
+    for (auto it = response.tensor_sizes().begin();
+         it != response.tensor_sizes().end(); it++) {
+      tensor_sizes.push_back(size_t(*it));
+      total_dimension_size += size_t(*it);
+    }
+    
+    // Every tensor participating in Allgather operation may have different
+    // first dimension size, but the rest of dimensions are same for all
+    // tensors.  Here we get shape of tensor sliced by first dimension.
+    TensorShape single_slice_shape;
+    for (int i = 1; i < e.tensor.shape().dims(); i++) {
+      single_slice_shape.AddDim(e.tensor.dim_size(i));
+    }
+
+    // Allgather output will have shape of:
+    // (sum of first dimension of every tensor) x (tensor slice shape).
+    TensorShape output_shape;
+    output_shape.AddDim((int64)total_dimension_size);
+    output_shape.AppendShape(single_slice_shape);
+    
+    MPI_Datatype dtype;
+    status = GetMPIDataType(e.tensor, &dtype);
+    if (!status.ok()) {
+      timeline.End(e.tensor_name, nullptr);
+      e.callback(status);
+      return;
+    }
+    //rbpittma: This is where gather is different. In allgather, every
+    //rank uses e.context to allocate a large custom receive
+    //buffer. In gather, only root rank needs to do
+    //this. Additionally, there are 3 buffers that the root needs, but
+    //other ranks do not. We set these to a default value of NULL for
+    //the other ranks
+    int* recvcounts = NULL;
+    int* displcmnts = NULL;
+    void* recvbuf = NULL;
+    if (horovod_global.rank == e.root_rank) {
+      ACTIVITY_START_ALL(entries, timeline, "ALLOCATE_OUTPUT")
+	status = e.context->allocate_output(0, output_shape, &e.output);
+      if (!status.ok()) {
+	timeline.End(e.tensor_name, nullptr);
+	e.callback(status);
+	return;
+      }
+
+#if HAVE_CUDA
+      // On GPU allocation is asynchronous, we need to wait for it to complete.
+      auto device_context = e.context->op_device_context();
+      if (device_context != nullptr) {
+	device_context->stream()->BlockHostUntilDone();
+      }
+#endif
+      ACTIVITY_END_ALL(entries, timeline)
+      //Set receive buffer to new output array
+      recvbuf = (void*)e.output->tensor_data().data();
+      
+      //Need to perform the exact same receive and displacement
+      //calculations as performed in allgather
+      ACTIVITY_START_ALL(entries, timeline, "MPI_GATHER")
+      recvcounts = new int[tensor_sizes.size()];
+      displcmnts = new int[tensor_sizes.size()];
+      for (size_t i = 0; i < tensor_sizes.size(); i++) {
+	recvcounts[i] =
+          (int)(single_slice_shape.num_elements() * tensor_sizes[i]);
+	if (i == 0) {
+	  displcmnts[i] = 0;
+	} else {
+	  displcmnts[i] = recvcounts[i - 1] + displcmnts[i - 1];
+	}
+      }
+    }
+    
+    auto result = MPI_Gatherv((const void*)e.tensor.tensor_data().data(),
+			      (int)e.tensor.NumElements(), dtype, recvbuf,
+			      recvcounts, displcmnts, dtype, e.root_rank, MPI_COMM_WORLD);
+    //Dealloc only on root
+    if (horovod_global.rank == e.root_rank) {
+      delete[] recvcounts;
+      delete[] displcmnts;
+    }
+    MPI_CHECK(entries, "MPI_Gatherv", result)
+    ACTIVITY_END_ALL(entries, timeline)
+      
     timeline.End(e.tensor_name, e.output);
     e.callback(Status::OK());
 
@@ -1693,6 +1797,45 @@ void EnqueueTensorAllgather(OpKernelContext* context, const Tensor& tensor,
 
 // MPI must be initialized and the background thread must be running before
 // this function is called.
+void EnqueueTensorGather(OpKernelContext* context, const Tensor& tensor,
+			 GPU_EVENT_IF_CUDA ready_event,
+			 const std::string name, const int device,
+			 StatusCallback callback) {
+  MPIDataType dtype;
+  Status status = DataTypeToMPIType(tensor.dtype(), &dtype);
+  if (!status.ok()) {
+    callback(status);
+    return;
+  }
+
+  int rank;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+  MPIRequest message;
+  message.set_request_rank(rank);
+  message.set_tensor_name(name);
+  message.set_tensor_type(dtype);
+  message.set_device(device);
+  message.set_request_type(MPIRequest::ALLGATHER);
+  for (int i = 0; i < tensor.shape().dims(); i++) {
+    message.add_tensor_shape(tensor.shape().dim_size(i));
+  }
+
+  TensorTableEntry e;
+  e.tensor_name = name;
+  e.context = context;
+  e.tensor = tensor;
+  e.ready_event = ready_event;
+  e.device = device;
+  e.callback = callback;
+
+  std::lock_guard<std::mutex> guard(horovod_global.mutex);
+  horovod_global.tensor_table.emplace(name, std::move(e));
+  horovod_global.message_queue.push(message);
+}
+
+// MPI must be initialized and the background thread must be running before
+// this function is called.
 void EnqueueTensorBroadcast(OpKernelContext* context, const Tensor& tensor,
                             Tensor* output, int root_rank,
                             GPU_EVENT_IF_CUDA ready_event,
@@ -1919,6 +2062,72 @@ on a tensor with the same name must have the same dimension for that tensor.
 
 Arguments
     tensor:     A tensor to broadcast.
+    root_rank:  Rank that will send data, other ranks will receive data.
+
+Output
+    output:    A tensor with the same shape as `tensor` and same value as
+               `tensor` on root rank.
+)doc");
+
+  //GATHER
+
+  class HorovodGatherOp : public AsyncOpKernel {
+public:
+  explicit HorovodGatherOp(OpKernelConstruction* context)
+      : AsyncOpKernel(context) {
+    OP_REQUIRES_OK(context, context->GetAttr("root_rank", &root_rank_));
+  }
+
+  void ComputeAsync(OpKernelContext* context, DoneCallback done) override {
+    OP_REQUIRES_OK(context, CheckInitialized());
+
+    auto node_name = name();
+    auto device = GetDeviceID(context);
+    auto tensor = context->input(0);
+    Tensor* output = nullptr;
+    if (horovod_global.rank != root_rank_) {
+      context->set_output(0, tensor);//Non root ranks just get the
+				     //same tensor as output
+    }
+    //   OP_REQUIRES_OK(context,
+    //                  context->allocate_output(0, tensor.shape(), &output));
+    // }
+    GPU_EVENT_IF_CUDA ready_event = RecordReadyEvent(context);
+    EnqueueTensorGather(context, tensor, output, root_rank_, ready_event,
+                           node_name, device,
+                           [context, done](const Status& status) {
+                             context->SetStatus(status);
+                             done();
+                           });
+  }
+
+private:
+  int root_rank_;
+};
+
+REGISTER_KERNEL_BUILDER(Name("HorovodGather").Device(DEVICE_CPU),
+                        HorovodGatherOp);
+  //TODO: Check
+// #if HOROVOD_GPU_GATHER
+// REGISTER_KERNEL_BUILDER(Name("HorovodGather").Device(DEVICE_GPU),
+//                         HorovodGatherOp);
+// #endif
+
+REGISTER_OP("HorovodGather")
+    .Attr("T: {uint8, int8, uint16, int16, int32, int64, float32, float64, bool}")
+    .Attr("root_rank: int")
+    .Input("tensor: T")
+    .Output("output: T")
+    .SetShapeFn([](shape_inference::InferenceContext* c) {
+      c->set_output(0, c->input(0));
+      return Status::OK();
+    })
+    .Doc(R"doc(
+Perform an MPI Gather on a tensor. All other processes that do a gather
+on a tensor with the same name must have the same dimension for that tensor.
+
+Arguments
+    tensor:     A tensor to gather.
     root_rank:  Rank that will send data, other ranks will receive data.
 
 Output

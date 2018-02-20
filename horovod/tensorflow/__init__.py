@@ -36,6 +36,7 @@ from horovod.tensorflow.mpi_ops import local_size
 from horovod.tensorflow.mpi_ops import rank
 from horovod.tensorflow.mpi_ops import local_rank
 from horovod.tensorflow.mpi_ops import allgather
+from horovod.tensorflow.mpi_ops import gather
 from horovod.tensorflow.mpi_ops import broadcast
 from horovod.tensorflow.mpi_ops import _allreduce
 from horovod.tensorflow.mpi_ops import init

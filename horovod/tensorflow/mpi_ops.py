@@ -202,3 +202,25 @@ def broadcast(tensor, root_rank, name=None):
 
 
 ops.NotDifferentiable('HorovodBroadcast')
+
+def gather(tensor, root_rank, name=None):
+    """An op which concatenates the input tensor with the same input tensor on
+    all other Horovod processes, and sends the result to root_rank only. 
+    
+    The concatenation is done on the first dimension, so the input tensors on the
+    different processes must have the same rank and shape, except for the first
+    dimension, which is allowed to be different.
+    
+    Returns:
+      A tensor of the same type as `tensor`, concatenated on dimension zero
+      across all processes, but only for root_rank. The shape is
+      identical to the input shape, except for 
+      the first dimension, which may be greater and is the sum of all first
+      dimensions of the tensors in different Horovod processes.
+    """
+    if name is None:
+        name = 'HorovodGather_%s' % _normalize_name(tensor.name)
+    return MPI_LIB.horovod_gather(tensor, name=name, root_rank=root_rank)
+
+
+ops.NotDifferentiable('HorovodGather')
