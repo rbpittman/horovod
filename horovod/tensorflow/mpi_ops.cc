@@ -1798,6 +1798,7 @@ void EnqueueTensorAllgather(OpKernelContext* context, const Tensor& tensor,
 // MPI must be initialized and the background thread must be running before
 // this function is called.
 void EnqueueTensorGather(OpKernelContext* context, const Tensor& tensor,
+			 int root_rank, 
 			 GPU_EVENT_IF_CUDA ready_event,
 			 const std::string name, const int device,
 			 StatusCallback callback) {
@@ -1813,6 +1814,7 @@ void EnqueueTensorGather(OpKernelContext* context, const Tensor& tensor,
 
   MPIRequest message;
   message.set_request_rank(rank);
+  message.set_root_rank(root_rank);
   message.set_tensor_name(name);
   message.set_tensor_type(dtype);
   message.set_device(device);
@@ -1825,6 +1827,7 @@ void EnqueueTensorGather(OpKernelContext* context, const Tensor& tensor,
   e.tensor_name = name;
   e.context = context;
   e.tensor = tensor;
+  e.root_rank = root_rank;
   e.ready_event = ready_event;
   e.device = device;
   e.callback = callback;
@@ -2080,11 +2083,15 @@ public:
 
   void ComputeAsync(OpKernelContext* context, DoneCallback done) override {
     OP_REQUIRES_OK(context, CheckInitialized());
-
     auto node_name = name();
     auto device = GetDeviceID(context);
     auto tensor = context->input(0);
-    Tensor* output = nullptr;
+    // Tensor* output = nullptr;
+    //Nobody needs to allocate output except for the root_rank_ guy,
+    //and his allocation happends in his PerformOperation section
+    //(since size is not yet known).
+    //Also don't need "output" parameter going to EnqueueTensorGather
+    //since no preallocation is happening. 
     if (horovod_global.rank != root_rank_) {
       context->set_output(0, tensor);//Non root ranks just get the
 				     //same tensor as output
@@ -2093,7 +2100,7 @@ public:
     //                  context->allocate_output(0, tensor.shape(), &output));
     // }
     GPU_EVENT_IF_CUDA ready_event = RecordReadyEvent(context);
-    EnqueueTensorGather(context, tensor, output, root_rank_, ready_event,
+    EnqueueTensorGather(context, tensor, root_rank_, ready_event,
                            node_name, device,
                            [context, done](const Status& status) {
                              context->SetStatus(status);
@@ -2112,14 +2119,23 @@ REGISTER_KERNEL_BUILDER(Name("HorovodGather").Device(DEVICE_CPU),
 // REGISTER_KERNEL_BUILDER(Name("HorovodGather").Device(DEVICE_GPU),
 //                         HorovodGatherOp);
 // #endif
-
+//rbpittma: The Gather operation is unique in the sense that returned tensor
+// shapes will not be uniform. Bcast and allgather all are uniform in
+// their returned tensors. In gather, the non-root ranks have no
+// relevant data to return, so the same tensor is returned. The root
+// rank merges all the sends. We use the same op registration as
+// allgather since it sets the first dimension of the input dimension
+// to be unknown, which is more or less correct. In theory, we could
+// modify this code to account for the current process rank. 
 REGISTER_OP("HorovodGather")
     .Attr("T: {uint8, int8, uint16, int16, int32, int64, float32, float64, bool}")
-    .Attr("root_rank: int")
     .Input("tensor: T")
     .Output("output: T")
     .SetShapeFn([](shape_inference::InferenceContext* c) {
-      c->set_output(0, c->input(0));
+      shape_inference::ShapeHandle output;
+      TF_RETURN_IF_ERROR(
+          c->ReplaceDim(c->input(0), 0, c->UnknownDim(), &output));
+      c->set_output(0, output);
       return Status::OK();
     })
     .Doc(R"doc(
@@ -2128,7 +2144,7 @@ on a tensor with the same name must have the same dimension for that tensor.
 
 Arguments
     tensor:     A tensor to gather.
-    root_rank:  Rank that will send data, other ranks will receive data.
+    root_rank:  Rank that will receive merged data from all other ranks.
 
 Output
     output:    A tensor with the same shape as `tensor` and same value as
