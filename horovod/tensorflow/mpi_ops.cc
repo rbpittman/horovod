@@ -1818,7 +1818,7 @@ void EnqueueTensorGather(OpKernelContext* context, const Tensor& tensor,
   message.set_tensor_name(name);
   message.set_tensor_type(dtype);
   message.set_device(device);
-  message.set_request_type(MPIRequest::ALLGATHER);
+  message.set_request_type(MPIRequest::GATHER);
   for (int i = 0; i < tensor.shape().dims(); i++) {
     message.add_tensor_shape(tensor.shape().dim_size(i));
   }
