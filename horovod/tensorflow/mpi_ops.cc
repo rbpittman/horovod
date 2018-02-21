@@ -2129,6 +2129,7 @@ REGISTER_KERNEL_BUILDER(Name("HorovodGather").Device(DEVICE_CPU),
 // modify this code to account for the current process rank. 
 REGISTER_OP("HorovodGather")
     .Attr("T: {uint8, int8, uint16, int16, int32, int64, float32, float64, bool}")
+    .Attr("root_rank: int")
     .Input("tensor: T")
     .Output("output: T")
     .SetShapeFn([](shape_inference::InferenceContext* c) {
