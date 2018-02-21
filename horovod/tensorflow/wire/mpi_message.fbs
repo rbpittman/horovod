@@ -35,7 +35,8 @@ enum MPIDataType:byte {
 enum MPIRequestType:byte {
     ALLREDUCE = 0,
     ALLGATHER = 1,
-    BROADCAST = 2
+    BROADCAST = 2,
+    GATHER    = 3
 }
 table MPIRequest {
     // The request rank is necessary to create a consistent ordering of results,
@@ -70,7 +71,8 @@ enum MPIResponseType:byte {
     BROADCAST = 2,
     ERROR = 3,
     DONE = 4,
-    SHUTDOWN = 5
+    SHUTDOWN = 5,
+    GATHER = 6
 }
 table MPIResponse {
     // Empty if the type is DONE or SHUTDOWN.
