@@ -101,7 +101,7 @@ class BroadcastGlobalVariablesHook(tf.train.SessionRunHook):
     training is started with random weights or restored from a checkpoint.
     """
 
-    def __init__(self, root_rank, device='', group):
+    def __init__(self, root_rank, group, device=''):
         """Construct a new BroadcastGlobalVariablesHook that will broadcast all
         global variables from root rank to all other processes during initialization.
 
