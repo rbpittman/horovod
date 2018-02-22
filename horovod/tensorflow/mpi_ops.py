@@ -89,10 +89,10 @@ def init(group=-1, group_ranks=None):
         #Invalid parameters
         raise ValueError("Invalid parameters sent to init, must specify group_ranks")
     if group == -1:
-        num_group_ranks = -1
+        num_group_ranks = 0
     else:
         num_group_ranks = len(group_ranks)
-    array_type = ctypes.c_int * len(group_ranks)
+    array_type = ctypes.c_int * num_group_ranks
     return MPI_LIB_CTYPES.horovod_tensorflow_init(ctypes.c_int(group),
                                                   ctypes.c_int(num_group_ranks),
                                                   array_type(*group_ranks))

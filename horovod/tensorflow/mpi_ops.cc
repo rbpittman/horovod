@@ -1692,7 +1692,7 @@ Status CheckInitialized(int group) {
 }
 
 // C interface to initialize Horovod.
-  extern "C" void horovod_tensorflow_init(int group, int num_ranks, int * group_ranks) { InitializeHorovodOnce(group, num_ranks, group_ranks); }
+extern "C" void horovod_tensorflow_init(int group, int num_ranks, int * group_ranks) { InitializeHorovodOnce(group, num_ranks, group_ranks); }
 
 
 // C interface to get index of current Horovod process.

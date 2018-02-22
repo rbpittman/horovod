@@ -34,6 +34,8 @@ import tensorflow as tf
 from horovod.tensorflow.mpi_ops import size
 from horovod.tensorflow.mpi_ops import local_size
 from horovod.tensorflow.mpi_ops import rank
+from horovod.tensorflow.mpi_ops import global_rank
+from horovod.tensorflow.mpi_ops import global_size
 from horovod.tensorflow.mpi_ops import local_rank
 from horovod.tensorflow.mpi_ops import allgather
 from horovod.tensorflow.mpi_ops import gather
