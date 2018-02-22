@@ -1361,7 +1361,9 @@ void CheckForStalledTensors(HorovodGlobalState& state) {
 void BackgroundThreadLoop(HorovodGlobalState& state, int num_ranks, int * group_ranks) {
   // Initialize MPI. This must happen on the background thread, since not all
   // MPI implementations support being called from multiple threads.
-  MPI_Init_thread(NULL, NULL, MPI_THREAD_MULTIPLE);
+  int provided;
+  MPI_Init_thread(NULL, NULL, MPI_THREAD_MULTIPLE, &provided);
+  assert(provided == MPI_THREAD_MULTIPLE);
   
   // Get MPI global rank
   int global_rank;
@@ -1401,20 +1403,24 @@ void BackgroundThreadLoop(HorovodGlobalState& state, int num_ranks, int * group_
 
     //Get group rank
     int subrank;
-    MPI_Comm_rank(subcomm, rank);
+    MPI_Comm_rank(subcomm, &subrank);
     
     //Set state parameters
     state.comm = subcomm;
     state.size = subsize;
     state.rank = subrank;
   }
-
+  int rank = state.rank;
+  int size = state.size;
+  
+  bool is_coordinator = rank == 0;
+  
   state.global_rank = global_rank;
   state.local_rank = local_rank;
   state.global_size = global_size;
   state.local_size = local_size;
   state.initialization_done = true;
-
+  
   // Open the timeline file on coordinator.
   auto horovod_timeline = std::getenv("HOROVOD_TIMELINE");
   if (is_coordinator && horovod_timeline != nullptr) {
@@ -2001,7 +2007,7 @@ public:
   }
 
   void ComputeAsync(OpKernelContext* context, DoneCallback done) override {
-    OP_REQUIRES_OK(context, CheckInitialized());
+    OP_REQUIRES_OK(context, CheckInitialized(group_));
 
     auto node_name = name();
     auto device = GetDeviceID(context);
@@ -2057,7 +2063,7 @@ public:
   }
 
   void ComputeAsync(OpKernelContext* context, DoneCallback done) override {
-    OP_REQUIRES_OK(context, CheckInitialized());
+    OP_REQUIRES_OK(context, CheckInitialized(group_));
 
     auto node_name = name();
     auto device = GetDeviceID(context);
@@ -2115,7 +2121,7 @@ public:
   }
 
   void ComputeAsync(OpKernelContext* context, DoneCallback done) override {
-    OP_REQUIRES_OK(context, CheckInitialized());
+    OP_REQUIRES_OK(context, CheckInitialized(group_));
 
     auto node_name = name();
     auto device = GetDeviceID(context);
@@ -2182,7 +2188,7 @@ public:
   }
 
   void ComputeAsync(OpKernelContext* context, DoneCallback done) override {
-    OP_REQUIRES_OK(context, CheckInitialized());
+    OP_REQUIRES_OK(context, CheckInitialized(group_));
     auto node_name = name();
     auto device = GetDeviceID(context);
     auto tensor = context->input(0);
