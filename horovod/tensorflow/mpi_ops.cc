@@ -1636,7 +1636,7 @@ void BackgroundThreadLoop(HorovodGlobalState& state, int num_ranks, int * group_
           break;
         } else {
           // Process the current message
-          PerformOperation(state.tensor_table, response);
+          PerformOperation(state.tensor_table, response, std::ref(state));
         }
       }
     }
