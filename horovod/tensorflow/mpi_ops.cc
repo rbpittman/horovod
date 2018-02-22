@@ -1857,7 +1857,7 @@ void EnqueueTensorAllreduce(OpKernelContext* context, const Tensor& tensor,
 
   int rank;
   // MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  MPI_Comm_rank(horovod_global[group_].comm, &rank);
+  MPI_Comm_rank(horovod_global[group].comm, &rank);
 
   MPIRequest message;
   message.set_request_rank(rank);
@@ -1899,7 +1899,7 @@ void EnqueueTensorGather(OpKernelContext* context, const Tensor& tensor,
 
   int rank;
   // MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  MPI_Comm_rank(horovod_global[group_].comm, &rank);
+  MPI_Comm_rank(horovod_global[group].comm, &rank);
 
   MPIRequest message;
   message.set_request_rank(rank);
@@ -1943,7 +1943,7 @@ void EnqueueTensorBroadcast(OpKernelContext* context, const Tensor& tensor,
 
   int rank;
   // MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  MPI_Comm_rank(horovod_global[group_].comm, &rank);
+  MPI_Comm_rank(horovod_global[group].comm, &rank);
 
   MPIRequest message;
   message.set_request_rank(rank);
