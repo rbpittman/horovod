@@ -42,7 +42,7 @@ from horovod.tensorflow.mpi_ops import _allreduce
 from horovod.tensorflow.mpi_ops import init
 
 
-def allreduce(tensor, average=True, device_dense='', device_sparse='', group):
+def allreduce(tensor, group, average=True, device_dense='', device_sparse=''):
     """Perform an allreduce on a tf.Tensor or tf.IndexedSlices.
 
     Arguments:
