@@ -34,8 +34,6 @@ import tensorflow as tf
 from horovod.tensorflow.mpi_ops import size
 from horovod.tensorflow.mpi_ops import local_size
 from horovod.tensorflow.mpi_ops import rank
-from horovod.tensorflow.mpi_ops import global_rank
-from horovod.tensorflow.mpi_ops import global_size
 from horovod.tensorflow.mpi_ops import local_rank
 from horovod.tensorflow.mpi_ops import allgather
 from horovod.tensorflow.mpi_ops import gather
@@ -44,7 +42,7 @@ from horovod.tensorflow.mpi_ops import _allreduce
 from horovod.tensorflow.mpi_ops import init
 
 
-def allreduce(tensor, group, average=True, device_dense='', device_sparse=''):
+def allreduce(tensor, average=True, device_dense='', device_sparse=''):
     """Perform an allreduce on a tf.Tensor or tf.IndexedSlices.
 
     Arguments:
@@ -66,8 +64,8 @@ def allreduce(tensor, group, average=True, device_dense='', device_sparse=''):
         with tf.device(device_sparse):
             # For IndexedSlices, do two allgathers intead of an allreduce.
             horovod_size = tf.cast(size(), tensor.values.dtype)
-            values = allgather(tensor.values, group)
-            indices = allgather(tensor.indices, group)
+            values = allgather(tensor.values)
+            indices = allgather(tensor.indices)
 
             # To make this operation into an average, divide all gathered values by
             # the Horovod size.
@@ -83,14 +81,14 @@ def allreduce(tensor, group, average=True, device_dense='', device_sparse=''):
         return new_tensor
 
 
-def broadcast_global_variables(root_rank, group):
+def broadcast_global_variables(root_rank):
     """Broadcasts all global variables from root rank to all other processes.
 
     Arguments:
         root_rank: rank of the process from which global variables will be broadcasted
         to all other processes.
     """
-    return tf.group(*[tf.assign(var, broadcast(var, root_rank, group))
+    return tf.group(*[tf.assign(var, broadcast(var, root_rank))
                       for var in tf.global_variables()])
 
 
@@ -103,7 +101,7 @@ class BroadcastGlobalVariablesHook(tf.train.SessionRunHook):
     training is started with random weights or restored from a checkpoint.
     """
 
-    def __init__(self, root_rank, group, device=''):
+    def __init__(self, root_rank, device=''):
         """Construct a new BroadcastGlobalVariablesHook that will broadcast all
         global variables from root rank to all other processes during initialization.
 
@@ -118,12 +116,11 @@ class BroadcastGlobalVariablesHook(tf.train.SessionRunHook):
         self.root_rank = root_rank
         self.bcast_op = None
         self.device = device
-        self.group = group
-        
+
     def begin(self):
         if not self.bcast_op:
             with tf.device(self.device):
-                self.bcast_op = broadcast_global_variables(self.root_rank, self.group)
+                self.bcast_op = broadcast_global_variables(self.root_rank)
 
     def after_create_session(self, session, coord):
         session.run(self.bcast_op)
@@ -133,7 +130,7 @@ class DistributedOptimizer(tf.train.Optimizer):
     """An optimizer that wraps another tf.Optimizer, using an allreduce to
     average gradient values before applying gradients to model weights."""
 
-    def __init__(self, optimizer, group, name=None, use_locking=False, device_dense='',
+    def __init__(self, optimizer, name=None, use_locking=False, device_dense='',
                  device_sparse=''):
         """Construct a new DistributedOptimizer, which uses another optimizer
         under the hood for computing single-process gradient values and
@@ -163,7 +160,6 @@ class DistributedOptimizer(tf.train.Optimizer):
         self._optimizer = optimizer
         self._device_dense = device_dense
         self._device_sparse = device_sparse
-        self.group = group
         super(DistributedOptimizer, self).__init__(
             name=name, use_locking=use_locking)
 

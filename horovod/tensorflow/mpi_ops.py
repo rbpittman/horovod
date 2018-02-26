@@ -77,45 +77,19 @@ MPI_LIB = _load_library('mpi_lib' + _get_ext_suffix(),
 MPI_LIB_CTYPES = _load_ctypes_dll('mpi_lib' + _get_ext_suffix())
 
 
-def init(group=-1, group_ranks=None):
+def init():
     """A function which initializes Horovod.
-    Defaults to using 1 group. If group is specified, then it is used as the group index,
-    and group_ranks should all be specified. 
-    
-    WARNING: Very limited error checking on multiple init specifications. Don't
-             provide incorrect input...
     """
-    if group != -1 and group_ranks == None:
-        #Invalid parameters
-        raise ValueError("Invalid parameters sent to init, must specify group_ranks")
-    if group == -1:
-        num_group_ranks = 0
-    else:
-        num_group_ranks = len(group_ranks)
-    array_type = ctypes.c_int * num_group_ranks
-    return MPI_LIB_CTYPES.horovod_tensorflow_init(ctypes.c_int(group),
-                                                  ctypes.c_int(num_group_ranks),
-                                                  array_type(*group_ranks))
+    return MPI_LIB_CTYPES.horovod_tensorflow_init()
 
-def size(group=-1):
+
+def size():
     """A function which returns the number of Horovod processes.
 
     Returns:
       An integer scalar containing the number of Horovod processes.
     """
-    size = MPI_LIB_CTYPES.horovod_tensorflow_size(ctypes.c_int(group))
-    if size == -1:
-        raise ValueError(
-            'Horovod has not been initialized; use horovod.tensorflow.init().')
-    return size
-
-def global_size():
-    """A function which returns the number of Horovod processes.
-
-    Returns:
-      An integer scalar containing the number of Horovod processes.
-    """
-    size = MPI_LIB_CTYPES.horovod_tensorflow_global_size()
+    size = MPI_LIB_CTYPES.horovod_tensorflow_size()
     if size == -1:
         raise ValueError(
             'Horovod has not been initialized; use horovod.tensorflow.init().')
@@ -136,25 +110,13 @@ def local_size():
     return local_size
 
 
-def rank(group=-1):
+def rank():
     """A function which returns the Horovod rank of the calling process.
 
     Returns:
       An integer scalar with the Horovod rank of the calling process.
     """
-    rank = MPI_LIB_CTYPES.horovod_tensorflow_rank(ctypes.c_int(group))
-    if rank == -1:
-        raise ValueError(
-            'Horovod has not been initialized; use horovod.tensorflow.init().')
-    return rank
-
-def global_rank():
-    """A function which returns the Horovod rank of the calling process.
-
-    Returns:
-      An integer scalar with the Horovod rank of the calling process.
-    """
-    rank = MPI_LIB_CTYPES.horovod_tensorflow_global_rank()
+    rank = MPI_LIB_CTYPES.horovod_tensorflow_rank()
     if rank == -1:
         raise ValueError(
             'Horovod has not been initialized; use horovod.tensorflow.init().')
@@ -181,7 +143,7 @@ def _normalize_name(name):
     return re.sub('[^a-zA-Z0-9_]', '_', name)
 
 
-def _allreduce(tensor, name=None, group=-1):
+def _allreduce(tensor, name=None):
     """An op which sums an input tensor over all the Horovod processes.
 
     The reduction operation is keyed by the name of the op. The tensor type and
@@ -194,13 +156,13 @@ def _allreduce(tensor, name=None, group=-1):
     """
     if name is None:
         name = 'HorovodAllreduce_%s' % _normalize_name(tensor.name)
-    return MPI_LIB.horovod_allreduce(tensor, name=name, group=group)
+    return MPI_LIB.horovod_allreduce(tensor, name=name)
 
 
 ops.NotDifferentiable('HorovodAllreduce')
 
 
-def allgather(tensor, name=None, group=-1):
+def allgather(tensor, name=None):
     """An op which concatenates the input tensor with the same input tensor on
     all other Horovod processes.
 
@@ -216,13 +178,13 @@ def allgather(tensor, name=None, group=-1):
     """
     if name is None:
         name = 'HorovodAllgather_%s' % _normalize_name(tensor.name)
-    return MPI_LIB.horovod_allgather(tensor, name=name, group=group)
+    return MPI_LIB.horovod_allgather(tensor, name=name)
 
 
 ops.NotDifferentiable('HorovodAllgather')
 
 
-def broadcast(tensor, root_rank, name=None, group=-1):
+def broadcast(tensor, root_rank, name=None):
     """An op which broadcasts the input tensor on root rank to the same input tensor
     on all other Horovod processes.
 
@@ -236,12 +198,12 @@ def broadcast(tensor, root_rank, name=None, group=-1):
     """
     if name is None:
         name = 'HorovodBroadcast_%s' % _normalize_name(tensor.name)
-    return MPI_LIB.horovod_broadcast(tensor, name=name, root_rank=root_rank, group=group)
+    return MPI_LIB.horovod_broadcast(tensor, name=name, root_rank=root_rank)
 
 
 ops.NotDifferentiable('HorovodBroadcast')
 
-def gather(tensor, root_rank, name=None, group=-1):
+def gather(tensor, root_rank, name=None):
     """An op which concatenates the input tensor with the same input tensor on
     all other Horovod processes, and sends the result to root_rank only. 
     
@@ -258,7 +220,7 @@ def gather(tensor, root_rank, name=None, group=-1):
     """
     if name is None:
         name = 'HorovodGather_%s' % _normalize_name(tensor.name)
-    return MPI_LIB.horovod_gather(tensor, name=name, root_rank=root_rank, group=group)
+    return MPI_LIB.horovod_gather(tensor, name=name, root_rank=root_rank)
 
 
 ops.NotDifferentiable('HorovodGather')
