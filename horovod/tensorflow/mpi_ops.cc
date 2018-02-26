@@ -17,6 +17,8 @@
 #include <queue>
 #include <thread>
 #include <unordered_map>
+#include <stdio.h>
+// #include <unistd.h>
 
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/op_kernel.h"
@@ -124,6 +126,9 @@ typedef std::unordered_map<
     std::string,
     std::tuple<std::vector<MPIRequest>, std::chrono::steady_clock::time_point>>
     MessageTable;
+
+
+// static std::atomic_flag initialized_mpi = ATOMIC_FLAG_INIT;
 
 // The global state required for the MPI ops.
 //
@@ -1361,9 +1366,19 @@ void CheckForStalledTensors(HorovodGlobalState& state) {
 void BackgroundThreadLoop(HorovodGlobalState& state, int num_ranks, int * group_ranks) {
   // Initialize MPI. This must happen on the background thread, since not all
   // MPI implementations support being called from multiple threads.
-  int provided;
-  MPI_Init_thread(NULL, NULL, MPI_THREAD_MULTIPLE, &provided);
-  assert(provided == MPI_THREAD_MULTIPLE);
+  fprintf(stderr, "Num ranks %d\n", num_ranks);
+  int mpi_initialized;
+  MPI_Initialized(&mpi_initialized);
+  if(!mpi_initialized) {
+    int provided;
+    MPI_Init_thread(NULL, NULL, MPI_THREAD_MULTIPLE, &provided);
+    assert(provided == MPI_THREAD_MULTIPLE);
+  }
+  
+  
+  // int provided;
+  // MPI_Init_thread(NULL, NULL, MPI_THREAD_MULTIPLE, &provided);
+  // assert(provided == MPI_THREAD_MULTIPLE);
   
   // Get MPI global rank
   int global_rank;
@@ -1375,12 +1390,14 @@ void BackgroundThreadLoop(HorovodGlobalState& state, int num_ranks, int * group_
   MPI_Comm_size(MPI_COMM_WORLD, &global_size);
   
   // Determine local rank by querying the local communicator.
-  MPI_Comm local_comm;
-  MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL,
-                      &local_comm);
-  int local_rank, local_size;
-  MPI_Comm_rank(local_comm, &local_rank);
-  MPI_Comm_size(local_comm, &local_size);
+  // MPI_Comm local_comm;
+  // MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL,
+  //                     &local_comm);
+  // int local_rank, local_size;
+  // MPI_Comm_rank(local_comm, &local_rank);
+  // MPI_Comm_size(local_comm, &local_size);
+  int local_rank = -1;
+  int local_size = -1;
   
   //Setup comm 
   if(num_ranks == -1) {
@@ -1396,6 +1413,13 @@ void BackgroundThreadLoop(HorovodGlobalState& state, int num_ranks, int * group_
     MPI_Comm subcomm;
     MPI_Comm_create(MPI_COMM_WORLD, subgroup, &subcomm);
     
+    if(subcomm == MPI_COMM_NULL) {
+      //Not member of the group
+      // fprintf(stderr, "Num ranks %d\n", num_ranks);
+      // MPI_Finalize();
+      // return;
+      sleep(30);
+    }
     //Check group size
     int subsize;
     MPI_Comm_size(subcomm, &subsize);
@@ -1437,7 +1461,8 @@ void BackgroundThreadLoop(HorovodGlobalState& state, int num_ranks, int * group_
   if (is_coordinator) {
     state.message_table = std::unique_ptr<MessageTable>(new MessageTable());
   }
-
+  
+  fprintf(stderr, "Starting main loop (rank %d)\n", global_rank);
   // The coordinator sends a SHUTDOWN message to trigger shutdown.
   bool should_shut_down = false;
   do {
@@ -1616,7 +1641,7 @@ void BackgroundThreadLoop(HorovodGlobalState& state, int num_ranks, int * group_
         // Find number of characters in message (including zero byte).
         int msg_length;
         MPI_Get_count(&status, MPI_BYTE, &msg_length);
-
+	
         // Get tensor name from MPI into an std::string.
         char* buffer = new char[msg_length];
         MPI_Recv(buffer, msg_length, MPI_BYTE, 0, TAG_NOTIFY, state.comm,
@@ -1646,7 +1671,7 @@ void BackgroundThreadLoop(HorovodGlobalState& state, int num_ranks, int * group_
        it != state.tensor_fusion_buffers.end(); it++) {
     delete it->second;
   }
-
+  
   // TODO: init.cu:645 WARN Cuda failure 'driver shutting down'
   //#if HAVE_NCCL
   //  for (auto it = state.streams.begin();
@@ -1658,7 +1683,11 @@ void BackgroundThreadLoop(HorovodGlobalState& state, int num_ranks, int * group_
   //    ncclCommDestroy(it->second);
   //  }
   //#endif
-  MPI_Finalize();
+  int mpi_finalized;
+  MPI_Finalized(&mpi_finalized);
+  if(!mpi_finalized) {
+    MPI_Finalize();
+  }
 }
 
 // Start Horovod background thread. Ensure that this is
@@ -1670,6 +1699,13 @@ void InitializeHorovodOnce(int group, int num_ranks, int * group_ranks) {
     //the BgThdLoop to do global group
     num_ranks = -1;
   }
+  // if(!initialized_mpi.test_and_set()) {
+  //   //Init MPI once
+  //   int provided;
+  //   MPI_Init_thread(NULL, NULL, MPI_THREAD_MULTIPLE, &provided);
+  //   assert(provided == MPI_THREAD_MULTIPLE);
+  // }
+  
   // Ensure background thread is only started once.
   if (!horovod_global[group].initialize_flag.test_and_set()) {
     horovod_global[group].background_thread =
