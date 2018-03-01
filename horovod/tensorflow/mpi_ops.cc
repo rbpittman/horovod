@@ -1478,7 +1478,7 @@ void BackgroundThreadLoop(HorovodGlobalState * states, int * group_lengths, int 
     // This delay determines thread frequency and MPI message latency
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
     for(int group_idx = 0; group_idx < 2; group_idx++) {
-      int rank = states[group_idx].rank;
+      // int rank = states[group_idx].rank;
       int size = states[group_idx].size;
       bool is_coordinator = states[group_idx].rank == 0;
       
