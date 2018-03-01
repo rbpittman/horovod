@@ -1711,7 +1711,7 @@ void BackgroundThreadLoop(HorovodGlobalState * states, int * group_lengths, int 
 
 // Start Horovod background thread. Ensure that this is
 // only done once no matter how many times this function is called.
-void InitializeHorovodOnce(int group, int * num_ranks, int * group_ranks) {
+void InitializeHorovodOnce(int * num_ranks, int * group_ranks) {
   // if(group == -1) {
   //   group = 0;
   //Ensure num_ranks is -1 since group was not specified. This tells
@@ -1734,7 +1734,7 @@ void InitializeHorovodOnce(int group, int * num_ranks, int * group_ranks) {
   }
 
   // Wait to ensure that the background thread has finished initializing MPI.
-  while (!horovod_global[group].initialization_done) {
+  while (!horovod_global[0].initialization_done) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
 }
@@ -1749,7 +1749,7 @@ Status CheckInitialized(int group) {
 }
 
 // C interface to initialize Horovod.
-extern "C" void horovod_tensorflow_init(int group, int * num_ranks, int * group_ranks) { InitializeHorovodOnce(group, num_ranks, group_ranks); }
+extern "C" void horovod_tensorflow_init(int * num_ranks, int * group_ranks) { InitializeHorovodOnce(num_ranks, group_ranks); }
 
 
 // C interface to get index of current Horovod process.
@@ -1957,6 +1957,7 @@ void EnqueueTensorGather(OpKernelContext* context, const Tensor& tensor,
   int rank;
   // MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_rank(horovod_global[group].comm, &rank);
+  printf("Group rank %d enqueued message from group %d\n", rank, group);
 
   MPIRequest message;
   message.set_request_rank(rank);
@@ -2243,8 +2244,9 @@ public:
     OP_REQUIRES_OK(context, context->GetAttr("root_rank", &root_rank_));
     OP_REQUIRES_OK(context, context->GetAttr("group", &group_));
   }
-
+  
   void ComputeAsync(OpKernelContext* context, DoneCallback done) override {
+    printf("ComputeAsync Gather\n");
     OP_REQUIRES_OK(context, CheckInitialized(group_));
     auto node_name = name();
     auto device = GetDeviceID(context);
@@ -2264,11 +2266,11 @@ public:
     // }
     GPU_EVENT_IF_CUDA ready_event = RecordReadyEvent(context);
     EnqueueTensorGather(context, tensor, root_rank_, group_, ready_event,
-                           node_name, device,
-                           [context, done](const Status& status) {
-                             context->SetStatus(status);
-                             done();
-                           });
+			node_name, device,
+			[context, done](const Status& status) {
+			  context->SetStatus(status);
+			  done();
+			});
   }
 
 private:

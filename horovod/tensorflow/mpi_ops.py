@@ -97,9 +97,8 @@ def init(g1_ranks, g2_ranks):
     
     ranks_array_fn = ctypes.c_int * sum(lens_array)
     concat_array = g1_ranks + g2_ranks
-    return MPI_LIB_CTYPES.horovod_tensorflow_init(ctypes.c_int(group),
-                                                  lens_array_fn(*lens_array),
-                                                  array_fn(*concat_array))
+    return MPI_LIB_CTYPES.horovod_tensorflow_init(lens_array_fn(*lens_array),
+                                                  ranks_array_fn(*concat_array))
     # return MPI_LIB_CTYPES.horovod_tensorflow_init(ctypes.c_int(group),
     #                                               ctypes.c_int(num_group_ranks),
     #                                               array_type(*group_ranks))
