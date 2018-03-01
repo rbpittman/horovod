@@ -188,7 +188,9 @@ struct HorovodGlobalState {
 
   //Custom communicator
   MPI_Comm comm;
+  bool is_member = true;
   
+  bool destroy = true;//whether to close out the threads in the destructor
 // The CUDA stream used for data transfers and within-allreduce operations.
 // A naive implementation would use the TensorFlow StreamExecutor CUDA
 // stream. However, the allreduce and allgather require doing memory copies
@@ -221,7 +223,7 @@ struct HorovodGlobalState {
     // Make sure that the destructor of the background thread is safe to
     // call. If a thread is still joinable (not detached or complete) its
     // destructor cannot be called.
-    if (background_thread.joinable()) {
+    if (destroy && background_thread.joinable()) {
       shut_down = true;
       background_thread.join();
     }
@@ -1363,18 +1365,23 @@ void CheckForStalledTensors(HorovodGlobalState& state) {
 //      response from the coordinator. At that point, the tick ends.
 //      If instead of "DONE" they receive "SHUTDOWN", they exit their background
 //      loop.
-void BackgroundThreadLoop(HorovodGlobalState& state, int num_ranks, int * group_ranks) {
+
+//PRE: len(num_ranks) == 2
+//     len(both_group_ranks) == num_ranks[0] + num_ranks[1]
+void BackgroundThreadLoop(HorovodGlobalState * states, int * group_lengths, int * both_group_ranks) {
   // Initialize MPI. This must happen on the background thread, since not all
   // MPI implementations support being called from multiple threads.
-  fprintf(stderr, "Num ranks %d\n", num_ranks);
-  int mpi_initialized;
-  MPI_Initialized(&mpi_initialized);
-  if(!mpi_initialized) {
-    int provided;
-    MPI_Init_thread(NULL, NULL, MPI_THREAD_MULTIPLE, &provided);
-    assert(provided == MPI_THREAD_MULTIPLE);
-  }
-  
+  // int * g1_ranks = both_group_ranks;
+  // int * g2_ranks = both_group_ranks + group_lengths[0];//Skip pointer over first part of array.
+  // fprintf(stderr, "Num ranks %d\n", num_ranks);
+  // int mpi_initialized;
+  // MPI_Initialized(&mpi_initialized);
+  // if(!mpi_initialized) {
+  // int provided;
+  // MPI_Init_thread(NULL, NULL, MPI_THREAD_MULTIPLE, &provided);
+  // assert(provided == MPI_THREAD_MULTIPLE);
+  // }
+  MPI_Init(NULL, NULL);
   
   // int provided;
   // MPI_Init_thread(NULL, NULL, MPI_THREAD_MULTIPLE, &provided);
@@ -1390,315 +1397,327 @@ void BackgroundThreadLoop(HorovodGlobalState& state, int num_ranks, int * group_
   MPI_Comm_size(MPI_COMM_WORLD, &global_size);
   
   // Determine local rank by querying the local communicator.
-  // MPI_Comm local_comm;
-  // MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL,
-  //                     &local_comm);
-  // int local_rank, local_size;
-  // MPI_Comm_rank(local_comm, &local_rank);
-  // MPI_Comm_size(local_comm, &local_size);
-  int local_rank = -1;
-  int local_size = -1;
+  MPI_Comm local_comm;
+  MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL,
+                      &local_comm);
+  int local_rank, local_size;
+  MPI_Comm_rank(local_comm, &local_rank);
+  MPI_Comm_size(local_comm, &local_size);
+  // int local_rank = -1;
+  // int local_size = -1;
   
   //Setup comm 
-  if(num_ranks == -1) {
-    //Global group:
-    state.comm = MPI_COMM_WORLD;
-    state.size = global_size;
-    state.rank = global_rank;
-  } else {
-    MPI_Group world_group;
-    MPI_Comm_group(MPI_COMM_WORLD, &world_group);
+  // if(num_ranks_g1 == -1) {
+  //   //Global group:
+  //   state.comm = MPI_COMM_WORLD;
+  //   state.size = global_size;
+  //   state.rank = global_rank;
+  // } else {
+  MPI_Group world_group;
+  MPI_Comm_group(MPI_COMM_WORLD, &world_group);
+  for(int i = 0; i < 2; i++) {//Iterate over the 2 groups, i.e. the 2 global states
+    states[i].global_rank = global_rank;
+    states[i].local_rank = local_rank;
+    states[i].global_size = global_size;
+    states[i].local_size = local_size;
+    
+    int num_ranks = group_lengths[i];
+    int * group_ranks;
+    if(i == 0) group_ranks = both_group_ranks;
+    else       group_ranks = both_group_ranks + group_lengths[0];
     MPI_Group subgroup;
     MPI_Group_incl(world_group, num_ranks, group_ranks, &subgroup);
     MPI_Comm subcomm;
     MPI_Comm_create(MPI_COMM_WORLD, subgroup, &subcomm);
     
-    if(subcomm == MPI_COMM_NULL) {
-      //Not member of the group
-      // fprintf(stderr, "Num ranks %d\n", num_ranks);
-      // MPI_Finalize();
-      // return;
-      sleep(30);
+    states[i].comm = subcomm;//may be MPI_COMM_NULL
+    states[i].is_member = (subcomm != MPI_COMM_NULL);
+    if(states[i].is_member) {//Only members of group get these parameters
+      //Get group size
+      int subsize;
+      MPI_Comm_size(subcomm, &subsize);
+      assert(subsize == num_ranks);
+      //Get group rank
+      int subrank;
+      MPI_Comm_rank(subcomm, &subrank);
+      //Set state parameters
+      states[i].size = subsize;
+      states[i].rank = subrank;
     }
-    //Check group size
-    int subsize;
-    MPI_Comm_size(subcomm, &subsize);
-    assert(subsize == num_ranks);
+    states[i].initialization_done = true;
 
-    //Get group rank
-    int subrank;
-    MPI_Comm_rank(subcomm, &subrank);
-    
-    //Set state parameters
-    state.comm = subcomm;
-    state.size = subsize;
-    state.rank = subrank;
-  }
-  int rank = state.rank;
-  int size = state.size;
-  
-  bool is_coordinator = rank == 0;
-  
-  state.global_rank = global_rank;
-  state.local_rank = local_rank;
-  state.global_size = global_size;
-  state.local_size = local_size;
-  state.initialization_done = true;
-  
-  // Open the timeline file on coordinator.
-  auto horovod_timeline = std::getenv("HOROVOD_TIMELINE");
-  if (is_coordinator && horovod_timeline != nullptr) {
-    state.timeline.Initialize(std::string(horovod_timeline));
+    //Other setup
+    // int rank = state.rank;
+    // int size = state.size;
+    bool is_coordinator = states[i].rank == 0;
+    // Open the timeline file on coordinator.
+    auto horovod_timeline = std::getenv("HOROVOD_TIMELINE");
+    if (is_coordinator && horovod_timeline != nullptr) {
+      states[i].timeline.Initialize(std::string(horovod_timeline));
+    }
+
+    // Override Tensor Fusion threshold, if it's set.
+    auto horovod_fusion_threshold = std::getenv("HOROVOD_FUSION_THRESHOLD");
+    if (horovod_fusion_threshold != nullptr) {
+      states[i].tensor_fusion_threshold = size_t(std::atol(horovod_fusion_threshold));
+    }
+
+    // Initialize the tensor count table. No tensors are available yet.
+    if (is_coordinator) {
+      states[i].message_table = std::unique_ptr<MessageTable>(new MessageTable());
+    }
   }
 
-  // Override Tensor Fusion threshold, if it's set.
-  auto horovod_fusion_threshold = std::getenv("HOROVOD_FUSION_THRESHOLD");
-  if (horovod_fusion_threshold != nullptr) {
-    state.tensor_fusion_threshold = size_t(std::atol(horovod_fusion_threshold));
-  }
-
-  // Initialize the tensor count table. No tensors are available yet.
-  if (is_coordinator) {
-    state.message_table = std::unique_ptr<MessageTable>(new MessageTable());
-  }
+  //DONE SETUP
+  //START LOOP
   
-  fprintf(stderr, "Starting main loop (rank %d)\n", global_rank);
+  // fprintf(stderr, "Starting main loop (rank %d)\n", global_rank);
   // The coordinator sends a SHUTDOWN message to trigger shutdown.
   bool should_shut_down = false;
   do {
     // This delay determines thread frequency and MPI message latency
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
-
-    // Copy the data structures from global state under this lock.
-    // However, don't keep the lock for the rest of the loop, so that
-    // enqueued stream callbacks can continue.
-    std::queue<MPIRequest> message_queue;
-    {
-      std::lock_guard<std::mutex> guard(state.mutex);
-      while (!state.message_queue.empty()) {
-        MPIRequest message = state.message_queue.front();
-        state.message_queue.pop();
-        message_queue.push(message);
+    for(int group_idx = 0; group_idx < 2; group_idx++) {
+      int rank = states[group_idx].rank;
+      int size = states[group_idx].size;
+      bool is_coordinator = states[group_idx].rank == 0;
+      
+      // Copy the data structures from global state under this lock.
+      // However, don't keep the lock for the rest of the loop, so that
+      // enqueued stream callbacks can continue.
+      std::queue<MPIRequest> message_queue;
+      {
+	std::lock_guard<std::mutex> guard(states[group_idx].mutex);
+	while (!states[group_idx].message_queue.empty()) {
+	  MPIRequest message = states[group_idx].message_queue.front();
+	  states[group_idx].message_queue.pop();
+	  message_queue.push(message);
+	}
       }
-    }
 
-    // Collect all tensors that are ready to be reduced. Record them in the
-    // tensor count table (rank zero) or send them to rank zero to be
-    // recorded (everyone else).
-    std::vector<std::string> ready_to_reduce;
-    while (!message_queue.empty()) {
-      // Pop the first available message message
-      MPIRequest message = message_queue.front();
-      message_queue.pop();
+      // Collect all tensors that are ready to be reduced. Record them in the
+      // tensor count table (rank zero) or send them to rank zero to be
+      // recorded (everyone else).
+      std::vector<std::string> ready_to_reduce;
+      while (!message_queue.empty()) {
+	// Pop the first available message message
+	MPIRequest message = message_queue.front();
+	message_queue.pop();
 
+	if (is_coordinator) {
+	  bool reduce = IncrementTensorCount(states[group_idx].message_table, message, size, std::ref(states[group_idx]));
+	  if (reduce) {
+	    ready_to_reduce.push_back(message.tensor_name());
+	  }
+	} else {
+	  std::string encoded_message;
+	  MPIRequest::SerializeToString(message, encoded_message);
+	  MPI_Send(encoded_message.c_str(), (int)encoded_message.length() + 1,
+		   MPI_BYTE, RANK_ZERO, TAG_NOTIFY, states[group_idx].comm);
+	}
+      }
+
+      // Rank zero has put all its own tensors in the tensor count table.
+      // Now, it should count all the tensors that are coming from other
+      // ranks at this tick. It should keep getting tensors until it gets a
+      // DONE message from all the other ranks.
       if (is_coordinator) {
-        bool reduce = IncrementTensorCount(state.message_table, message, size, std::ref(state));
-        if (reduce) {
-          ready_to_reduce.push_back(message.tensor_name());
-        }
+	// Count of DONE messages. Keep receiving messages until the number
+	// of messages is equal to the number of processes. Initialize to
+	// one since the coordinator is effectively done.
+	int completed_ranks = 1;
+	while (completed_ranks != size) {
+	  MPI_Status status;
+	  MPI_Probe(MPI_ANY_SOURCE, TAG_NOTIFY, states[group_idx].comm, &status);
+
+	  // Find number of characters in message (including zero byte).
+	  int source_rank = status.MPI_SOURCE;
+	  int msg_length;
+	  MPI_Get_count(&status, MPI_BYTE, &msg_length);
+
+	  // If the length is zero, this is a DONE message.
+	  if (msg_length == 0) {
+	    completed_ranks++;
+	    MPI_Recv(NULL, 0, MPI_BYTE, source_rank, TAG_NOTIFY, states[group_idx].comm,
+		     &status);
+	    continue;
+	  }
+
+	  // Get tensor name from MPI into an std::string.
+	  char* buffer = new char[msg_length];
+	  MPI_Recv(buffer, msg_length, MPI_BYTE, source_rank, TAG_NOTIFY,
+		   states[group_idx].comm, &status);
+	  std::string received_data(buffer, (size_t)msg_length);
+	  delete[] buffer;
+
+	  MPIRequest received_message;
+	  MPIRequest::ParseFromString(received_message, received_data);
+	  auto received_name = received_message.tensor_name();
+
+	  bool reduce =
+	    IncrementTensorCount(states[group_idx].message_table, received_message, size, std::ref(states[group_idx]));
+	  if (reduce) {
+	    ready_to_reduce.push_back(received_name);
+	  }
+	}
+
+	// At this point, rank zero should have a fully updated tensor count
+	// table and should know all the tensors that need to be reduced or
+	// gathered, and everyone else should have sent all their information
+	// to rank zero. We can now do reductions and gathers; rank zero will
+	// choose which ones and in what order, and will notify the other ranks
+	// before doing each reduction.
+	std::vector<MPIResponse> responses;
+	for (auto it = ready_to_reduce.begin(); it != ready_to_reduce.end();
+	     it++) {
+	  MPIResponse response = ConstructMPIResponse(states[group_idx].message_table, *it);
+	  responses.push_back(std::move(response));
+	}
+
+	while (!responses.empty()) {
+	  auto it = responses.begin();
+	  MPIResponse response = *it;
+	  assert(response.tensor_names().size() == 1);
+	  it = responses.erase(it);
+
+	  if (response.response_type() == MPIResponse::ResponseType::ALLREDUCE) {
+	    // Attempt to add more responses to this fused response.
+	    auto& entry = states[group_idx].tensor_table[response.tensor_names()[0]];
+	    size_t tensor_size = entry.tensor.tensor_data().size();
+
+	    while (it != responses.end()) {
+	      assert(it->tensor_names().size() == 1);
+	      auto& new_entry = states[group_idx].tensor_table[it->tensor_names()[0]];
+	      size_t new_tensor_size = new_entry.tensor.tensor_data().size();
+
+	      if (response.response_type() == it->response_type() &&
+		  response.devices() == it->devices() &&
+		  entry.tensor.dtype() == new_entry.tensor.dtype() &&
+		  tensor_size + new_tensor_size <=
+		  states[group_idx].tensor_fusion_threshold) {
+		// These tensors will fuse together well.
+		tensor_size += new_tensor_size;
+		response.add_tensor_names(it->tensor_names()[0]);
+		it = responses.erase(it);
+	      } else {
+		// Don't try to fuse additional tensors since they are usually
+		// computed in order of requests and skipping tensors may mean
+		// that the batch will have to wait longer while skipped tensors
+		// could be reduced at that time.
+		break;
+	      }
+	    }
+	  }
+
+	  // Notify all nodes which tensors we'd like to reduce at this step.
+	  std::string encoded_response;
+	  MPIResponse::SerializeToString(response, encoded_response);
+	  for (int r = 1; r < size; r++) {
+	    MPI_Send(encoded_response.c_str(), (int)encoded_response.length() + 1,
+		     MPI_BYTE, r, TAG_NOTIFY, states[group_idx].comm);
+	  }
+
+	  // Perform the collective operation. All nodes should end up performing
+	  // the same operation.
+	  PerformOperation(states[group_idx].tensor_table, response, std::ref(states[group_idx]));
+	}
+
+	// Notify all nodes that we are done with the reductions for this tick.
+	MPIResponse done_response;
+	should_shut_down = states[group_idx].shut_down;
+	done_response.set_response_type(should_shut_down ? MPIResponse::SHUTDOWN
+					: MPIResponse::DONE);
+	std::string encoded_response;
+	MPIResponse::SerializeToString(done_response, encoded_response);
+	for (int r = 1; r < size; r++) {
+	  MPI_Send(encoded_response.c_str(), (int)encoded_response.length() + 1,
+		   MPI_BYTE, r, TAG_NOTIFY, states[group_idx].comm);
+	}
+
+	// Check for stalled tensors.
+	if (std::chrono::steady_clock::now() - states[group_idx].last_stall_check >
+	    STALL_WARNING_TIME) {
+	  CheckForStalledTensors(states[group_idx]);
+	  states[group_idx].last_stall_check = std::chrono::steady_clock::now();
+	}
       } else {
-        std::string encoded_message;
-        MPIRequest::SerializeToString(message, encoded_message);
-        MPI_Send(encoded_message.c_str(), (int)encoded_message.length() + 1,
-                 MPI_BYTE, RANK_ZERO, TAG_NOTIFY, state.comm);
-      }
-    }
+	// Notify the coordinator that this node is done sending messages.
+	// A DONE message is encoded as a zero-length message.
+	MPI_Send(NULL, 0, MPI_BYTE, RANK_ZERO, TAG_NOTIFY, states[group_idx].comm);
 
-    // Rank zero has put all its own tensors in the tensor count table.
-    // Now, it should count all the tensors that are coming from other
-    // ranks at this tick. It should keep getting tensors until it gets a
-    // DONE message from all the other ranks.
-    if (is_coordinator) {
-      // Count of DONE messages. Keep receiving messages until the number
-      // of messages is equal to the number of processes. Initialize to
-      // one since the coordinator is effectively done.
-      int completed_ranks = 1;
-      while (completed_ranks != size) {
-        MPI_Status status;
-        MPI_Probe(MPI_ANY_SOURCE, TAG_NOTIFY, state.comm, &status);
+	// Receive names for tensors to reduce from rank zero.
+	// Once we receive a empty DONE message, stop waiting for more names.
+	while (true) {
+	  MPI_Status status;
+	  MPI_Probe(0, TAG_NOTIFY, states[group_idx].comm, &status);
 
-        // Find number of characters in message (including zero byte).
-        int source_rank = status.MPI_SOURCE;
-        int msg_length;
-        MPI_Get_count(&status, MPI_BYTE, &msg_length);
-
-        // If the length is zero, this is a DONE message.
-        if (msg_length == 0) {
-          completed_ranks++;
-          MPI_Recv(NULL, 0, MPI_BYTE, source_rank, TAG_NOTIFY, state.comm,
-                   &status);
-          continue;
-        }
-
-        // Get tensor name from MPI into an std::string.
-        char* buffer = new char[msg_length];
-        MPI_Recv(buffer, msg_length, MPI_BYTE, source_rank, TAG_NOTIFY,
-                 state.comm, &status);
-        std::string received_data(buffer, (size_t)msg_length);
-        delete[] buffer;
-
-        MPIRequest received_message;
-        MPIRequest::ParseFromString(received_message, received_data);
-        auto received_name = received_message.tensor_name();
-
-        bool reduce =
-	  IncrementTensorCount(state.message_table, received_message, size, std::ref(state));
-        if (reduce) {
-          ready_to_reduce.push_back(received_name);
-        }
-      }
-
-      // At this point, rank zero should have a fully updated tensor count
-      // table and should know all the tensors that need to be reduced or
-      // gathered, and everyone else should have sent all their information
-      // to rank zero. We can now do reductions and gathers; rank zero will
-      // choose which ones and in what order, and will notify the other ranks
-      // before doing each reduction.
-      std::vector<MPIResponse> responses;
-      for (auto it = ready_to_reduce.begin(); it != ready_to_reduce.end();
-           it++) {
-        MPIResponse response = ConstructMPIResponse(state.message_table, *it);
-        responses.push_back(std::move(response));
-      }
-
-      while (!responses.empty()) {
-        auto it = responses.begin();
-        MPIResponse response = *it;
-        assert(response.tensor_names().size() == 1);
-        it = responses.erase(it);
-
-        if (response.response_type() == MPIResponse::ResponseType::ALLREDUCE) {
-          // Attempt to add more responses to this fused response.
-          auto& entry = state.tensor_table[response.tensor_names()[0]];
-          size_t tensor_size = entry.tensor.tensor_data().size();
-
-          while (it != responses.end()) {
-            assert(it->tensor_names().size() == 1);
-            auto& new_entry = state.tensor_table[it->tensor_names()[0]];
-            size_t new_tensor_size = new_entry.tensor.tensor_data().size();
-
-            if (response.response_type() == it->response_type() &&
-                response.devices() == it->devices() &&
-                entry.tensor.dtype() == new_entry.tensor.dtype() &&
-                tensor_size + new_tensor_size <=
-                    state.tensor_fusion_threshold) {
-              // These tensors will fuse together well.
-              tensor_size += new_tensor_size;
-              response.add_tensor_names(it->tensor_names()[0]);
-              it = responses.erase(it);
-            } else {
-              // Don't try to fuse additional tensors since they are usually
-              // computed in order of requests and skipping tensors may mean
-              // that the batch will have to wait longer while skipped tensors
-              // could be reduced at that time.
-              break;
-            }
-          }
-        }
-
-        // Notify all nodes which tensors we'd like to reduce at this step.
-        std::string encoded_response;
-        MPIResponse::SerializeToString(response, encoded_response);
-        for (int r = 1; r < size; r++) {
-          MPI_Send(encoded_response.c_str(), (int)encoded_response.length() + 1,
-                   MPI_BYTE, r, TAG_NOTIFY, state.comm);
-        }
-
-        // Perform the collective operation. All nodes should end up performing
-        // the same operation.
-        PerformOperation(state.tensor_table, response, std::ref(state));
-      }
-
-      // Notify all nodes that we are done with the reductions for this tick.
-      MPIResponse done_response;
-      should_shut_down = state.shut_down;
-      done_response.set_response_type(should_shut_down ? MPIResponse::SHUTDOWN
-                                                       : MPIResponse::DONE);
-      std::string encoded_response;
-      MPIResponse::SerializeToString(done_response, encoded_response);
-      for (int r = 1; r < size; r++) {
-        MPI_Send(encoded_response.c_str(), (int)encoded_response.length() + 1,
-                 MPI_BYTE, r, TAG_NOTIFY, state.comm);
-      }
-
-      // Check for stalled tensors.
-      if (std::chrono::steady_clock::now() - state.last_stall_check >
-          STALL_WARNING_TIME) {
-        CheckForStalledTensors(state);
-        state.last_stall_check = std::chrono::steady_clock::now();
-      }
-    } else {
-      // Notify the coordinator that this node is done sending messages.
-      // A DONE message is encoded as a zero-length message.
-      MPI_Send(NULL, 0, MPI_BYTE, RANK_ZERO, TAG_NOTIFY, state.comm);
-
-      // Receive names for tensors to reduce from rank zero.
-      // Once we receive a empty DONE message, stop waiting for more names.
-      while (true) {
-        MPI_Status status;
-        MPI_Probe(0, TAG_NOTIFY, state.comm, &status);
-
-        // Find number of characters in message (including zero byte).
-        int msg_length;
-        MPI_Get_count(&status, MPI_BYTE, &msg_length);
+	  // Find number of characters in message (including zero byte).
+	  int msg_length;
+	  MPI_Get_count(&status, MPI_BYTE, &msg_length);
 	
-        // Get tensor name from MPI into an std::string.
-        char* buffer = new char[msg_length];
-        MPI_Recv(buffer, msg_length, MPI_BYTE, 0, TAG_NOTIFY, state.comm,
-                 &status);
-        std::string received_message(buffer, (size_t)msg_length);
-        delete[] buffer;
+	  // Get tensor name from MPI into an std::string.
+	  char* buffer = new char[msg_length];
+	  MPI_Recv(buffer, msg_length, MPI_BYTE, 0, TAG_NOTIFY, states[group_idx].comm,
+		   &status);
+	  std::string received_message(buffer, (size_t)msg_length);
+	  delete[] buffer;
 
-        MPIResponse response;
-        MPIResponse::ParseFromString(response, received_message);
-        if (response.response_type() == MPIResponse::DONE) {
-          // No more messages this tick
-          break;
-        } else if (response.response_type() == MPIResponse::SHUTDOWN) {
-          // No more messages this tick, and the background thread should shut
-          // down
-          should_shut_down = true;
-          break;
-        } else {
-          // Process the current message
-          PerformOperation(state.tensor_table, response, std::ref(state));
-        }
+	  MPIResponse response;
+	  MPIResponse::ParseFromString(response, received_message);
+	  if (response.response_type() == MPIResponse::DONE) {
+	    // No more messages this tick
+	    break;
+	  } else if (response.response_type() == MPIResponse::SHUTDOWN) {
+	    // No more messages this tick, and the background thread should shut
+	    // down
+	    should_shut_down = true;
+	    break;
+	  } else {
+	    // Process the current message
+	    PerformOperation(states[group_idx].tensor_table, response, std::ref(states[group_idx]));
+	  }
+	}
       }
-    }
+    }//end for loop (over each group)
   } while (!should_shut_down);
 
-  for (auto it = state.tensor_fusion_buffers.begin();
-       it != state.tensor_fusion_buffers.end(); it++) {
-    delete it->second;
+  for(int group_idx = 0; group_idx < 2; group_idx++) {
+    for (auto it = states[group_idx].tensor_fusion_buffers.begin();
+	 it != states[group_idx].tensor_fusion_buffers.end(); it++) {
+      delete it->second;
+    }
+    
+    // TODO: init.cu:645 WARN Cuda failure 'driver shutting down'
+    //#if HAVE_NCCL
+    //  for (auto it = states[group_idx].streams.begin();
+    //       it != states[group_idx].streams.end(); it++) {
+    //    cudaStreamSynchronize(it->second);
+    //  }
+    //  for (auto it = states[group_idx].nccl_comms.begin();
+    //       it != states[group_idx].nccl_comms.end(); it++) {
+    //    ncclCommDestroy(it->second);
+    //  }
+    //#endif
+    // }
+    
+    // int mpi_finalized;
+    // MPI_Finalized(&mpi_finalized);
+    // if(!mpi_finalized) {
+    // MPI_Finalize();
+    // }
   }
-  
-  // TODO: init.cu:645 WARN Cuda failure 'driver shutting down'
-  //#if HAVE_NCCL
-  //  for (auto it = state.streams.begin();
-  //       it != state.streams.end(); it++) {
-  //    cudaStreamSynchronize(it->second);
-  //  }
-  //  for (auto it = state.nccl_comms.begin();
-  //       it != state.nccl_comms.end(); it++) {
-  //    ncclCommDestroy(it->second);
-  //  }
-  //#endif
-  int mpi_finalized;
-  MPI_Finalized(&mpi_finalized);
-  if(!mpi_finalized) {
-    MPI_Finalize();
-  }
+  MPI_Finalize();
 }
 
 // Start Horovod background thread. Ensure that this is
 // only done once no matter how many times this function is called.
-void InitializeHorovodOnce(int group, int num_ranks, int * group_ranks) {
-  if(group == -1) {
-    group = 0;
-    //Ensure num_ranks is -1 since group was not specified. This tells
-    //the BgThdLoop to do global group
-    num_ranks = -1;
-  }
+void InitializeHorovodOnce(int group, int * num_ranks, int * group_ranks) {
+  // if(group == -1) {
+  //   group = 0;
+  //Ensure num_ranks is -1 since group was not specified. This tells
+  //the BgThdLoop to do global group
+  //   num_ranks = -1;
+  // }
   // if(!initialized_mpi.test_and_set()) {
   //   //Init MPI once
   //   int provided;
@@ -1707,9 +1726,11 @@ void InitializeHorovodOnce(int group, int num_ranks, int * group_ranks) {
   // }
   
   // Ensure background thread is only started once.
-  if (!horovod_global[group].initialize_flag.test_and_set()) {
-    horovod_global[group].background_thread =
-      std::thread(BackgroundThreadLoop, std::ref(horovod_global[group]), num_ranks, group_ranks);
+  if (!horovod_global[0].initialize_flag.test_and_set()) {
+    horovod_global[0].background_thread =
+      std::thread(BackgroundThreadLoop, std::ref(horovod_global), num_ranks, group_ranks);
+    horovod_global[0].destroy = true;//Make sure only 1 state runs closing procedure
+    horovod_global[1].destroy = false;
   }
 
   // Wait to ensure that the background thread has finished initializing MPI.
@@ -1728,7 +1749,7 @@ Status CheckInitialized(int group) {
 }
 
 // C interface to initialize Horovod.
-extern "C" void horovod_tensorflow_init(int group, int num_ranks, int * group_ranks) { InitializeHorovodOnce(group, num_ranks, group_ranks); }
+extern "C" void horovod_tensorflow_init(int group, int * num_ranks, int * group_ranks) { InitializeHorovodOnce(group, num_ranks, group_ranks); }
 
 
 // C interface to get index of current Horovod process.
