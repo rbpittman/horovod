@@ -223,8 +223,9 @@ struct HorovodGlobalState {
     // Make sure that the destructor of the background thread is safe to
     // call. If a thread is still joinable (not detached or complete) its
     // destructor cannot be called.
+    // printf("DECON\n");
+    shut_down = true;
     if (destroy && background_thread.joinable()) {
-      shut_down = true;
       background_thread.join();
     }
   }
@@ -1473,11 +1474,15 @@ void BackgroundThreadLoop(HorovodGlobalState * states, int * group_lengths, int 
   
   // fprintf(stderr, "Starting main loop (rank %d)\n", global_rank);
   // The coordinator sends a SHUTDOWN message to trigger shutdown.
-  bool should_shut_down = false;
+  bool should_shut_down[] = {false, false};
   do {
     // This delay determines thread frequency and MPI message latency
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    for(int group_idx = 0; group_idx < 2; group_idx++) {
+    for(int group_idx = 0; group_idx < 2; group_idx++) {//TODO modify both_shut_down as needed
+      //If not group member, or if shutting down group, don't execute. 
+      if(!states[group_idx].is_member || should_shut_down[group_idx]) continue;//Using continue prevents another indentation
+      // if(should_shut_down) break;//Ensure shut down only occurs once
+      
       // int rank = states[group_idx].rank;
       int size = states[group_idx].size;
       bool is_coordinator = states[group_idx].rank == 0;
@@ -1529,12 +1534,12 @@ void BackgroundThreadLoop(HorovodGlobalState * states, int * group_lengths, int 
 	while (completed_ranks != size) {
 	  MPI_Status status;
 	  MPI_Probe(MPI_ANY_SOURCE, TAG_NOTIFY, states[group_idx].comm, &status);
-
+	  
 	  // Find number of characters in message (including zero byte).
 	  int source_rank = status.MPI_SOURCE;
 	  int msg_length;
 	  MPI_Get_count(&status, MPI_BYTE, &msg_length);
-
+	  
 	  // If the length is zero, this is a DONE message.
 	  if (msg_length == 0) {
 	    completed_ranks++;
@@ -1553,7 +1558,7 @@ void BackgroundThreadLoop(HorovodGlobalState * states, int * group_lengths, int 
 	  MPIRequest received_message;
 	  MPIRequest::ParseFromString(received_message, received_data);
 	  auto received_name = received_message.tensor_name();
-
+	  
 	  bool reduce =
 	    IncrementTensorCount(states[group_idx].message_table, received_message, size, std::ref(states[group_idx]));
 	  if (reduce) {
@@ -1624,8 +1629,8 @@ void BackgroundThreadLoop(HorovodGlobalState * states, int * group_lengths, int 
 
 	// Notify all nodes that we are done with the reductions for this tick.
 	MPIResponse done_response;
-	should_shut_down = states[group_idx].shut_down;
-	done_response.set_response_type(should_shut_down ? MPIResponse::SHUTDOWN
+	should_shut_down[group_idx] = states[group_idx].shut_down;
+	done_response.set_response_type(should_shut_down[group_idx] ? MPIResponse::SHUTDOWN
 					: MPIResponse::DONE);
 	std::string encoded_response;
 	MPIResponse::SerializeToString(done_response, encoded_response);
@@ -1670,7 +1675,7 @@ void BackgroundThreadLoop(HorovodGlobalState * states, int * group_lengths, int 
 	  } else if (response.response_type() == MPIResponse::SHUTDOWN) {
 	    // No more messages this tick, and the background thread should shut
 	    // down
-	    should_shut_down = true;
+	    should_shut_down[group_idx] = true;
 	    break;
 	  } else {
 	    // Process the current message
@@ -1679,8 +1684,10 @@ void BackgroundThreadLoop(HorovodGlobalState * states, int * group_lengths, int 
 	}
       }
     }//end for loop (over each group)
-  } while (!should_shut_down);
-
+    //either shouldn't shut down, or the rank is a member of both groups and 1 of the groups hasn't shut down yet.
+  // } while (!should_shut_down || (states[0].is_member && states[1].is_member && (!states[0].shut_down || !states[1].shut_down)));
+  } while ((states[0].is_member && !should_shut_down[0]) || (states[1].is_member && !should_shut_down[1]));
+  // printf("%d Trying to shutdown\n", states[0].global_rank);
   for(int group_idx = 0; group_idx < 2; group_idx++) {
     for (auto it = states[group_idx].tensor_fusion_buffers.begin();
 	 it != states[group_idx].tensor_fusion_buffers.end(); it++) {
@@ -1735,6 +1742,9 @@ void InitializeHorovodOnce(int * num_ranks, int * group_ranks) {
 
   // Wait to ensure that the background thread has finished initializing MPI.
   while (!horovod_global[0].initialization_done) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  while (!horovod_global[1].initialization_done) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
 }
