@@ -77,7 +77,7 @@ MPI_LIB = _load_library('mpi_lib' + _get_ext_suffix(),
 MPI_LIB_CTYPES = _load_ctypes_dll('mpi_lib' + _get_ext_suffix())
 
 
-def init(g1_ranks, g2_ranks):
+def init(group=-1, group_ranks=None):
     """A function which initializes Horovod.
     Defaults to using 1 group. If group is specified, then it is used as the group index,
     and group_ranks should all be specified. 
@@ -85,23 +85,17 @@ def init(g1_ranks, g2_ranks):
     WARNING: Very limited error checking on multiple init specifications. Don't
              provide incorrect input...
     """
-    # if group != -1 and group_ranks == None:
+    if group != -1 and group_ranks == None:
         #Invalid parameters
-        # raise ValueError("Invalid parameters sent to init, must specify group_ranks")
-    # if group == -1:
-    #     num_group_ranks = 0
-    # else:
-    #     num_group_ranks = len(group_ranks)
-    lens_array_fn = ctypes.c_int * 2
-    lens_array = [len(g1_ranks), len(g2_ranks)]
-    
-    ranks_array_fn = ctypes.c_int * sum(lens_array)
-    concat_array = g1_ranks + g2_ranks
-    return MPI_LIB_CTYPES.horovod_tensorflow_init(lens_array_fn(*lens_array),
-                                                  ranks_array_fn(*concat_array))
-    # return MPI_LIB_CTYPES.horovod_tensorflow_init(ctypes.c_int(group),
-    #                                               ctypes.c_int(num_group_ranks),
-    #                                               array_type(*group_ranks))
+        raise ValueError("Invalid parameters sent to init, must specify group_ranks")
+    if group == -1:
+        num_group_ranks = 0
+    else:
+        num_group_ranks = len(group_ranks)
+    array_type = ctypes.c_int * num_group_ranks
+    return MPI_LIB_CTYPES.horovod_tensorflow_init(ctypes.c_int(group),
+                                                  ctypes.c_int(num_group_ranks),
+                                                  array_type(*group_ranks))
 
 def size(group=-1):
     """A function which returns the number of Horovod processes.
@@ -165,6 +159,7 @@ def global_rank():
         raise ValueError(
             'Horovod has not been initialized; use horovod.tensorflow.init().')
     return rank
+
 
 def local_rank():
     """A function which returns the local Horovod rank of the calling process, within the
