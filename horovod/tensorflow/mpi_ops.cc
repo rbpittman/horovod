@@ -15,6 +15,7 @@
 // =============================================================================
 
 #include <queue>
+#include <vector>
 #include <thread>
 #include <unordered_map>
 #include <stdio.h>
@@ -152,7 +153,8 @@ struct HorovodGlobalState {
 
   // Background thread running MPI communication.
   std::thread background_thread;
-
+  bool thread_defined = false;
+  
   // Whether the background thread should shutdown.
   bool shut_down = false;
 
@@ -188,7 +190,7 @@ struct HorovodGlobalState {
 
   //Custom communicator
   MPI_Comm comm;
-  
+  bool is_coordinator;
 // The CUDA stream used for data transfers and within-allreduce operations.
 // A naive implementation would use the TensorFlow StreamExecutor CUDA
 // stream. However, the allreduce and allgather require doing memory copies
@@ -221,16 +223,42 @@ struct HorovodGlobalState {
     // Make sure that the destructor of the background thread is safe to
     // call. If a thread is still joinable (not detached or complete) its
     // destructor cannot be called.
-    if (background_thread.joinable()) {
+    if (thread_defined && background_thread.joinable()) {
       shut_down = true;
       background_thread.join();
     }
   }
 };
 
+
+struct HorovodGlobal {
+  std::vector<int> members;
+  HorovodGlobalState * array = NULL;
+  ~HorovodGlobal() {
+    if(array != NULL) {
+      delete[] array;
+    }
+  }
+};
+
 // All the Horovod state that must be stored globally per-process.
 // static HorovodGlobalState horovod_global;
-static HorovodGlobalState horovod_global[2];
+// static HorovodGlobalState horovod_global[2];
+// static std::vector<int> global_members; // which groups this rank belongs to
+// static HorovodGlobalState * horovod_global.array = NULL;
+static HorovodGlobal horovod_global;
+
+// static ShutdownHVD _shutdown_object;
+
+// struct ShutdownHVD {
+//   int _data = 0;//Not sure if structs can be size 0.
+//   ~ShutdownHVD() {
+//     if(horovod_global.array != NULL) {
+//       delete[] horovod_global.array;
+//     }
+//   }
+// };
+
 
 // For clarify in argument lists.
 #define RANK_ZERO 0
@@ -240,6 +268,67 @@ static HorovodGlobalState horovod_global[2];
 
 // Stall-check warning time
 #define STALL_WARNING_TIME std::chrono::seconds(60)
+
+static std::mutex mpi_init_lock;
+static std::mutex mpi_finalize_lock;
+
+//init and finalize provide thread-safe mpi init and finalize, allowing any number of threads to call these functions
+void init() {
+  bool ran_init = false;
+  int provided;
+  {
+    std::lock_guard<std::mutex> guard(mpi_init_lock);
+    int initialized;
+    MPI_Initialized(&initialized);
+    if(!initialized) {
+      ran_init = true;
+      MPI_Init_thread(NULL, NULL, MPI_THREAD_MULTIPLE, &provided);
+    }
+  }
+  if(ran_init) {
+    switch(provided) {
+    case MPI_THREAD_SINGLE:
+      printf("single");
+      break;
+    case MPI_THREAD_FUNNELED:
+      printf("funneled");
+      break;
+    case MPI_THREAD_SERIALIZED:
+      printf("serialized");
+      break;
+    case MPI_THREAD_MULTIPLE:
+      // printf("multiple");//Don't print correct, but print wrong
+      break;
+    }
+    // printf("\n");
+    assert(provided == MPI_THREAD_MULTIPLE);
+    if(provided != MPI_THREAD_MULTIPLE) {
+      fprintf(stderr, "ERROR MULTIPLE THREADS NOT PROVIDED\n");
+    }
+  }
+}
+
+void finalize() {
+  {
+    std::lock_guard<std::mutex> guard(mpi_finalize_lock);
+    int finalized;
+    MPI_Finalized(&finalized);
+    if(!finalized) {
+      MPI_Finalize();
+    }
+  }
+}
+
+bool done_hvd_init() {
+  if(horovod_global.array == NULL || horovod_global.members.empty()) return false;
+  
+  for(unsigned int i = 0; i < horovod_global.members.size(); i++) {
+    if(!horovod_global.array[horovod_global.members.at(i)].initialization_done)
+      return false;
+  }
+  return true;
+}
+
 
 // Store the MPIRequest for a name, and return whether the total count of
 // MPIRequests for that tensor is now equal to the MPI size (and thus we are
@@ -660,9 +749,10 @@ cudaError_t ReleaseCudaEvent(cudaEvent_t event) {
 
 // Process an MPIResponse by doing a reduction, a gather, a broadcast, or
 // raising an error.
-  void PerformOperation(TensorTable& tensor_table, MPIResponse response, HorovodGlobalState & state) {
+void PerformOperation(TensorTable& tensor_table, MPIResponse response, HorovodGlobalState & state) {
   std::vector<TensorTableEntry> entries;
   {
+    // fprintf(stderr, "global rank %d performing op\n", state.global_rank);
     // Lock on the tensor table.
     std::lock_guard<std::mutex> guard(state.mutex);
     
@@ -678,7 +768,7 @@ cudaError_t ReleaseCudaEvent(cudaEvent_t event) {
              response.response_type() == MPIResponse::GATHER    ||
              response.response_type() == MPIResponse::BROADCAST ||
              response.response_type() == MPIResponse::ERROR);
-
+      
       entries.push_back(iter->second);
 
       // Clear the tensor table of this tensor and its callbacks; the rest of
@@ -1264,6 +1354,7 @@ cudaError_t ReleaseCudaEvent(cudaEvent_t event) {
     timeline.End(e.tensor_name, nullptr);
     e.callback(status);
   }
+  // fprintf(stderr, "global rank %d done op\n", state.global_rank);
 }
 
 // Report Tensors that were submitted to be reduced, gathered or broadcasted by
@@ -1363,87 +1454,26 @@ void CheckForStalledTensors(HorovodGlobalState& state) {
 //      response from the coordinator. At that point, the tick ends.
 //      If instead of "DONE" they receive "SHUTDOWN", they exit their background
 //      loop.
-void BackgroundThreadLoop(HorovodGlobalState& state, int num_ranks, int * group_ranks) {
-  // Initialize MPI. This must happen on the background thread, since not all
-  // MPI implementations support being called from multiple threads.
-  fprintf(stderr, "Num ranks %d\n", num_ranks);
-  int mpi_initialized;
-  MPI_Initialized(&mpi_initialized);
-  if(!mpi_initialized) {
-    int provided;
-    MPI_Init_thread(NULL, NULL, MPI_THREAD_MULTIPLE, &provided);
-    assert(provided == MPI_THREAD_MULTIPLE);
-  }
-  
-  
-  // int provided;
-  // MPI_Init_thread(NULL, NULL, MPI_THREAD_MULTIPLE, &provided);
-  // assert(provided == MPI_THREAD_MULTIPLE);
-  
+void BackgroundThreadLoop(HorovodGlobalState& state) {
+  // printf("BTL started rank %d\n", state.global_rank);
   // Get MPI global rank
-  int global_rank;
-  MPI_Comm_rank(MPI_COMM_WORLD, &global_rank);
+  // int global_rank;
+  // MPI_Comm_rank(MPI_COMM_WORLD, &global_rank);
+  
+  // if(global_rank == 5) {
+  // printf("Rank %d\n", global_rank);
+  // printf("num_ranks: %d\n", num_ranks);
+  // for(int i = 0; i < num_ranks; i++) {
+  //   printf("%d ", group_ranks[i]);
+  // }
+  // printf("\n");
+  // }
+  // fflush(stdout);
+  
   // bool is_coordinator = rank == 0;
-  
-  // Get MPI size to determine how many tensors to wait for before reducing.
-  int global_size;
-  MPI_Comm_size(MPI_COMM_WORLD, &global_size);
-  
-  // Determine local rank by querying the local communicator.
-  // MPI_Comm local_comm;
-  // MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL,
-  //                     &local_comm);
-  // int local_rank, local_size;
-  // MPI_Comm_rank(local_comm, &local_rank);
-  // MPI_Comm_size(local_comm, &local_size);
-  int local_rank = -1;
-  int local_size = -1;
-  
-  //Setup comm 
-  if(num_ranks == -1) {
-    //Global group:
-    state.comm = MPI_COMM_WORLD;
-    state.size = global_size;
-    state.rank = global_rank;
-  } else {
-    MPI_Group world_group;
-    MPI_Comm_group(MPI_COMM_WORLD, &world_group);
-    MPI_Group subgroup;
-    MPI_Group_incl(world_group, num_ranks, group_ranks, &subgroup);
-    MPI_Comm subcomm;
-    MPI_Comm_create(MPI_COMM_WORLD, subgroup, &subcomm);
-    
-    if(subcomm == MPI_COMM_NULL) {
-      //Not member of the group
-      // fprintf(stderr, "Num ranks %d\n", num_ranks);
-      // MPI_Finalize();
-      // return;
-      sleep(30);
-    }
-    //Check group size
-    int subsize;
-    MPI_Comm_size(subcomm, &subsize);
-    assert(subsize == num_ranks);
-
-    //Get group rank
-    int subrank;
-    MPI_Comm_rank(subcomm, &subrank);
-    
-    //Set state parameters
-    state.comm = subcomm;
-    state.size = subsize;
-    state.rank = subrank;
-  }
-  int rank = state.rank;
+  bool is_coordinator = state.is_coordinator;
   int size = state.size;
-  
-  bool is_coordinator = rank == 0;
-  
-  state.global_rank = global_rank;
-  state.local_rank = local_rank;
-  state.global_size = global_size;
-  state.local_size = local_size;
-  state.initialization_done = true;
+  // fprintf(stderr, "Rank %d size %d\n", state.global_rank, size);
   
   // Open the timeline file on coordinator.
   auto horovod_timeline = std::getenv("HOROVOD_TIMELINE");
@@ -1456,19 +1486,21 @@ void BackgroundThreadLoop(HorovodGlobalState& state, int num_ranks, int * group_
   if (horovod_fusion_threshold != nullptr) {
     state.tensor_fusion_threshold = size_t(std::atol(horovod_fusion_threshold));
   }
-
+  
   // Initialize the tensor count table. No tensors are available yet.
   if (is_coordinator) {
     state.message_table = std::unique_ptr<MessageTable>(new MessageTable());
   }
   
-  fprintf(stderr, "Starting main loop (rank %d)\n", global_rank);
+  // fprintf(stderr, "Starting main loop (rank %d)\n", state.global_rank);
   // The coordinator sends a SHUTDOWN message to trigger shutdown.
   bool should_shut_down = false;
   do {
     // This delay determines thread frequency and MPI message latency
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
-
+    
+    // if(state.global_rank >= 5) fprintf(stderr, "tick rank %d\n", state.global_rank);
+    
     // Copy the data structures from global state under this lock.
     // However, don't keep the lock for the rest of the loop, so that
     // enqueued stream callbacks can continue.
@@ -1490,7 +1522,8 @@ void BackgroundThreadLoop(HorovodGlobalState& state, int num_ranks, int * group_
       // Pop the first available message message
       MPIRequest message = message_queue.front();
       message_queue.pop();
-
+      // fprintf(stderr, "Rank %d got a message with name %s\n", state.global_rank, message.tensor_name().c_str());
+      
       if (is_coordinator) {
         bool reduce = IncrementTensorCount(state.message_table, message, size, std::ref(state));
         if (reduce) {
@@ -1660,6 +1693,7 @@ void BackgroundThreadLoop(HorovodGlobalState& state, int num_ranks, int * group_
           should_shut_down = true;
           break;
         } else {
+	  // fprintf(stderr, "Rank %d Running perform op\n", state.global_rank);
           // Process the current message
           PerformOperation(state.tensor_table, response, std::ref(state));
         }
@@ -1683,22 +1717,146 @@ void BackgroundThreadLoop(HorovodGlobalState& state, int num_ranks, int * group_
   //    ncclCommDestroy(it->second);
   //  }
   //#endif
-  int mpi_finalized;
-  MPI_Finalized(&mpi_finalized);
-  if(!mpi_finalized) {
-    MPI_Finalize();
+  // int mpi_finalized;
+  // MPI_Finalized(&mpi_finalized);
+  // if(!mpi_finalized) {
+  //   MPI_Finalize();
+  // }
+  finalize();
+}
+
+bool contains(int val, int * array, int len) {
+  for(int i = 0; i < len; i++) {
+    if(val == array[i]) return true;
   }
+  return false;
+}
+
+bool vector_contains(int val, std::vector<int> & list) {
+  for(unsigned int i = 0; i < list.size(); i++) {
+    if(val == list.at(i)) return true;
+  }
+  return false;
+}
+
+
+void init_state(HorovodGlobalState & state, int num_ranks, int * group_ranks) {
+  //Get global rank
+  int global_rank;
+  MPI_Comm_rank(MPI_COMM_WORLD, &global_rank);
+  // fprintf(stderr, "Global rank %d start init\n", global_rank);
+  
+  // Get MPI size to determine how many tensors to wait for before reducing.
+  int global_size;
+  MPI_Comm_size(MPI_COMM_WORLD, &global_size);
+  
+  // Determine local rank by querying the local communicator.
+  MPI_Comm local_comm;
+  MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL,
+                      &local_comm);
+  int local_rank, local_size;
+  MPI_Comm_rank(local_comm, &local_rank);
+  MPI_Comm_size(local_comm, &local_size);
+  // int local_rank = -1;
+  // int local_size = -1;
+  // fprintf(stderr, "IJFI\n");
+  // int world_group_size;
+  // MPI_Group_size(world_group, &world_group_size);
+  // fprintf(stderr, "World group size for rank %d:%d\n", global_rank, world_group_size);
+  //get world group
+  MPI_Group world_group;
+  MPI_Comm_group(MPI_COMM_WORLD, &world_group);
+
+  MPI_Group subgroup;
+  MPI_Group_incl(world_group, num_ranks, group_ranks, &subgroup);
+  MPI_Comm subcomm;
+  MPI_Comm_create(MPI_COMM_WORLD, subgroup, &subcomm);
+  // fprintf(stderr, "HERE3 call %d\n", call);
+  
+  int subsize = -1;
+  int subrank = -1;
+  if(subcomm != MPI_COMM_NULL) {
+    //Check group size
+    MPI_Comm_size(subcomm, &subsize);
+    assert(subsize == num_ranks);
+    //Get group rank
+    MPI_Comm_rank(subcomm, &subrank);
+  }
+  //Set state parameters
+  state.comm = subcomm;
+  state.size = subsize;
+  state.rank = subrank;
+  state.is_coordinator = state.rank == 0;
+  
+  state.global_rank = global_rank;
+  state.local_rank  = local_rank;
+  state.global_size = global_size;
+  state.local_size  = local_size;
+  state.initialization_done = true;
+  // printf("Global rank %d done init, is coord %d\n", global_rank, state.is_coordinator);
 }
 
 // Start Horovod background thread. Ensure that this is
 // only done once no matter how many times this function is called.
-void InitializeHorovodOnce(int group, int num_ranks, int * group_ranks) {
-  if(group == -1) {
-    group = 0;
-    //Ensure num_ranks is -1 since group was not specified. This tells
-    //the BgThdLoop to do global group
-    num_ranks = -1;
+void InitializeHorovodOnce(int num_groups, int * group_lens, int * group_rankss) {
+  //Init global static ptr to length num_groups
+  horovod_global.array = new HorovodGlobalState[num_groups];
+  
+  //Init MPI
+  init();
+
+  //Get global rank
+  int global_rank;
+  MPI_Comm_rank(MPI_COMM_WORLD, &global_rank);
+  
+  //Check which group(s) rank is in, and launch background thread on corresponding global state
+  int * group_ranks = group_rankss;
+  for(int i = 0; i < num_groups; i++) {
+    if(i != 0) group_ranks += group_lens[i-1];
+    // if(contains(global_rank, group_ranks, group_lens[i])) {
+      //Then current rank is a member of the group, so start bg thd
+      // horovod_global.members.push_back(i);
+      //Init state beforehand, setting various communicator things
+      init_state(horovod_global.array[i], group_lens[i], group_ranks);//Downside is slower initialization
+      // printf("Launching thread\n");
+      // horovod_global.array[i].background_thread =
+      // 	std::thread(BackgroundThreadLoop, std::ref(horovod_global.array[i]));
+    // }
   }
+  
+  group_ranks = group_rankss;
+  for(int i = 0; i < num_groups; i++) {
+    if(i != 0) group_ranks += group_lens[i-1];
+    if(contains(global_rank, group_ranks, group_lens[i])) {
+      //Then current rank is a member of the group, so start bg thd
+      horovod_global.members.push_back(i);
+      if (!horovod_global.array[i].initialize_flag.test_and_set()) {
+	//Init state beforehand, setting various communicator things
+	// init_state(horovod_global.array[i], group_lens[i], group_ranks, world_group);//Downside is slower initialization
+	// printf("Launching thread\n");
+	horovod_global.array[i].thread_defined = true;
+	horovod_global.array[i].background_thread =
+	  std::thread(BackgroundThreadLoop, std::ref(horovod_global.array[i]));
+      }
+    }
+  }
+  
+  //Wait for all inits to finish (though this is less relevant since we already know init has completed)
+  for (unsigned int i = 0; i < horovod_global.members.size(); i++) {
+    int index = horovod_global.members.at(i);
+    // printf("Rank %d Waiting for group %d\n", global_rank, index);
+    while (!horovod_global.array[index].initialization_done) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    // printf("Rank %d Done waiting for group %d\n", global_rank, index);
+  }
+  
+  // if(group == -1) {
+  //   group = 0;
+  //Ensure num_ranks is -1 since group was not specified. This tells
+  //the BgThdLoop to do global group
+  //   num_ranks = -1;
+  // }
   // if(!initialized_mpi.test_and_set()) {
   //   //Init MPI once
   //   int provided;
@@ -1707,20 +1865,22 @@ void InitializeHorovodOnce(int group, int num_ranks, int * group_ranks) {
   // }
   
   // Ensure background thread is only started once.
-  if (!horovod_global[group].initialize_flag.test_and_set()) {
-    horovod_global[group].background_thread =
-      std::thread(BackgroundThreadLoop, std::ref(horovod_global[group]), num_ranks, group_ranks);
-  }
-
+  // if (!horovod_global[group].initialize_flag.test_and_set()) {
+  //   horovod_global[group].background_thread =
+  //     std::thread(BackgroundThreadLoop, std::ref(horovod_global[group]), num_ranks, group_ranks);
+  // }
+  
   // Wait to ensure that the background thread has finished initializing MPI.
-  while (!horovod_global[group].initialization_done) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  }
+  // while (!horovod_global[group].initialization_done) {
+  //   std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  // }
+  
 }
 
 // Check that Horovod is initialized.
 Status CheckInitialized(int group) {
-  if (!horovod_global[group].initialization_done) {
+  // if (!horovod_global[group].initialization_done) {
+  if(!done_hvd_init()) {
     return errors::FailedPrecondition(
         "Horovod has not been initialized; use horovod.tensorflow.init().");
   }
@@ -1728,8 +1888,7 @@ Status CheckInitialized(int group) {
 }
 
 // C interface to initialize Horovod.
-extern "C" void horovod_tensorflow_init(int group, int num_ranks, int * group_ranks) { InitializeHorovodOnce(group, num_ranks, group_ranks); }
-
+extern "C" void horovod_tensorflow_init(int num_groups, int * group_lens, int * group_rankss) { InitializeHorovodOnce(num_groups, group_lens, group_rankss); }
 
 // C interface to get index of current Horovod process.
 // Returns -1 if Horovod is not initialized.
@@ -1742,64 +1901,89 @@ extern "C" int horovod_tensorflow_global_rank() {
   // if(!horovod_global[0].initialization_done) {
   //   return -1;
   // }
-  if(horovod_global[0].initialization_done)
-    return horovod_global[0].global_rank;
-  if(horovod_global[1].initialization_done)
-    return horovod_global[1].global_rank;
+  
+  // if(horovod_global[0].initialization_done)
+  //   return horovod_global[0].global_rank;
+  // if(horovod_global[1].initialization_done)
+  //   return horovod_global[1].global_rank;
+  if(done_hvd_init()) {
+    return horovod_global.array[horovod_global.members.at(0)].global_rank;
+  }
   return -1;
 }
 
 // C interface to get index of current Horovod process.
 // Returns -1 if Horovod is not initialized.
 extern "C" int horovod_tensorflow_rank(int group) {
-  if(group==-1) group = 0;
-  if(!horovod_global[group].initialization_done) {
-    return -1;
+  // if(group==-1) group = 0;
+  assert(vector_contains(group, horovod_global.members));
+  if(horovod_global.array[group].initialization_done) {
+    return horovod_global.array[group].rank;
   }
-  return horovod_global[group].rank;
+  return -1;
 }
 
 
 // C interface to get index of current Horovod process in the node it is on..
 // Returns -1 if Horovod is not initialized.
 extern "C" int horovod_tensorflow_local_rank() {
-  if (!horovod_global[0].initialization_done) {
-    return -1;
+  // assert(vector_contains(group, horovod_global.members));
+  // if(horovod_global.array[group].initialization_done) {
+  if(done_hvd_init()) {
+    return horovod_global.array[horovod_global.members.at(0)].local_rank;
   }
-  return horovod_global[0].local_rank;
+  return -1;
+  // if (!horovod_global[0].initialization_done) {
+  //   return -1;
+  // }
+  // return horovod_global[0].local_rank;
 }
 
 // C interface to return number of Horovod processes.
 // Returns -1 if Horovod is not initialized.
 extern "C" int horovod_tensorflow_size(int group) {
-  if(group == -1) group = 0;
-  if (!horovod_global[group].initialization_done) {
-    return -1;
+  // if(group == -1) group = 0;
+  // if (!horovod_global[group].initialization_done) {
+  //   return -1;
+  // }
+  // return horovod_global[group].size;
+  assert(vector_contains(group, horovod_global.members));
+  if(horovod_global.array[group].initialization_done) {
+    return horovod_global.array[group].size;
   }
-  return horovod_global[group].size;
+  return -1;
 }
 
 // C interface to return number of Horovod processes.
 // Returns -1 if Horovod is not initialized.
 extern "C" int horovod_tensorflow_global_size() {
-  if(horovod_global[0].initialization_done)
-    return horovod_global[0].global_size;
-  if(horovod_global[1].initialization_done)
-    return horovod_global[1].global_size;
-  return -1;
+  
+  // if(horovod_global[0].initialization_done)
+  //   return horovod_global[0].global_size;
+  // if(horovod_global[1].initialization_done)
+  //   return horovod_global[1].global_size;
+  // return -1;
   // if (!horovod_global.initialization_done) {
   //   return -1;
   // }
   // return horovod_global.global_size;
+  if(done_hvd_init()) {
+    return horovod_global.array[horovod_global.members.at(0)].global_size;
+  }
+  return -1;
 }
 
 // C interface to return number of Horovod processes in the node it is on..
 // Returns -1 if Horovod is not initialized.
 extern "C" int horovod_tensorflow_local_size() {
-  if (!horovod_global[0].initialization_done) {
-    return -1;
+  // if (!horovod_global[0].initialization_done) {
+  //   return -1;
+  // }
+  // return horovod_global[0].local_size;
+  if(done_hvd_init()) {
+    return horovod_global.array[horovod_global.members.at(0)].local_rank;
   }
-  return horovod_global[0].local_size;
+  return -1;
 }
 
 // Convert a TensorFlow DataType to our MPIDataType.
@@ -1843,6 +2027,8 @@ void EnqueueTensorAllreduce(OpKernelContext* context, const Tensor& tensor,
                             Tensor* output, int group, GPU_EVENT_IF_CUDA ready_event,
                             const std::string name, const int device,
                             StatusCallback callback) {
+  assert(vector_contains(group, horovod_global.members));
+  
   MPIDataType dtype;
   Status status = DataTypeToMPIType(tensor.dtype(), &dtype);
   if (!status.ok()) {
@@ -1851,7 +2037,7 @@ void EnqueueTensorAllreduce(OpKernelContext* context, const Tensor& tensor,
   }
 
   int rank;
-  MPI_Comm_rank(horovod_global[group].comm, &rank);
+  MPI_Comm_rank(horovod_global.array[group].comm, &rank);
 
   MPIRequest message;
   message.set_request_rank(rank);
@@ -1873,17 +2059,18 @@ void EnqueueTensorAllreduce(OpKernelContext* context, const Tensor& tensor,
   e.callback = callback;
   e.group = group;
 
-  std::lock_guard<std::mutex> guard(horovod_global[group].mutex);
-  horovod_global[group].tensor_table.emplace(name, std::move(e));
-  horovod_global[group].message_queue.push(message);
+  std::lock_guard<std::mutex> guard(horovod_global.array[group].mutex);
+  horovod_global.array[group].tensor_table.emplace(name, std::move(e));
+  horovod_global.array[group].message_queue.push(message);
 }
 
 // MPI must be initialized and the background thread must be running before
 // this function is called.
-  void EnqueueTensorAllgather(OpKernelContext* context, const Tensor& tensor, int group, 
+void EnqueueTensorAllgather(OpKernelContext* context, const Tensor& tensor, int group, 
                             GPU_EVENT_IF_CUDA ready_event,
                             const std::string name, const int device,
                             StatusCallback callback) {
+  assert(vector_contains(group, horovod_global.members));
   MPIDataType dtype;
   Status status = DataTypeToMPIType(tensor.dtype(), &dtype);
   if (!status.ok()) {
@@ -1893,8 +2080,11 @@ void EnqueueTensorAllreduce(OpKernelContext* context, const Tensor& tensor,
 
   int rank;
   // MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  MPI_Comm_rank(horovod_global[group].comm, &rank);
-
+  MPI_Comm_rank(horovod_global.array[group].comm, &rank);
+  int global_rank;
+  MPI_Comm_rank(MPI_COMM_WORLD, &global_rank);
+  // printf("Group %d, subrank %d (global %d) requesting allgather\n", group, rank, global_rank);
+  
   MPIRequest message;
   message.set_request_rank(rank);
   message.set_tensor_name(name);
@@ -1914,9 +2104,9 @@ void EnqueueTensorAllreduce(OpKernelContext* context, const Tensor& tensor,
   e.callback = callback;
   e.group = group;
 
-  std::lock_guard<std::mutex> guard(horovod_global[group].mutex);
-  horovod_global[group].tensor_table.emplace(name, std::move(e));
-  horovod_global[group].message_queue.push(message);
+  std::lock_guard<std::mutex> guard(horovod_global.array[group].mutex);
+  horovod_global.array[group].tensor_table.emplace(name, std::move(e));
+  horovod_global.array[group].message_queue.push(message);
 }
 
 // MPI must be initialized and the background thread must be running before
@@ -1926,6 +2116,7 @@ void EnqueueTensorGather(OpKernelContext* context, const Tensor& tensor,
 			 GPU_EVENT_IF_CUDA ready_event,
 			 const std::string name, const int device,
 			 StatusCallback callback) {
+  assert(vector_contains(group, horovod_global.members));
   MPIDataType dtype;
   Status status = DataTypeToMPIType(tensor.dtype(), &dtype);
   if (!status.ok()) {
@@ -1935,7 +2126,7 @@ void EnqueueTensorGather(OpKernelContext* context, const Tensor& tensor,
 
   int rank;
   // MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  MPI_Comm_rank(horovod_global[group].comm, &rank);
+  MPI_Comm_rank(horovod_global.array[group].comm, &rank);
 
   MPIRequest message;
   message.set_request_rank(rank);
@@ -1958,9 +2149,9 @@ void EnqueueTensorGather(OpKernelContext* context, const Tensor& tensor,
   e.callback = callback;
   e.group = group;
 
-  std::lock_guard<std::mutex> guard(horovod_global[group].mutex);
-  horovod_global[group].tensor_table.emplace(name, std::move(e));
-  horovod_global[group].message_queue.push(message);
+  std::lock_guard<std::mutex> guard(horovod_global.array[group].mutex);
+  horovod_global.array[group].tensor_table.emplace(name, std::move(e));
+  horovod_global.array[group].message_queue.push(message);
 }
 
 // MPI must be initialized and the background thread must be running before
@@ -1970,6 +2161,7 @@ void EnqueueTensorBroadcast(OpKernelContext* context, const Tensor& tensor,
                             GPU_EVENT_IF_CUDA ready_event,
                             const std::string name, const int device,
                             StatusCallback callback) {
+  assert(vector_contains(group, horovod_global.members));
   MPIDataType dtype;
   Status status = DataTypeToMPIType(tensor.dtype(), &dtype);
   if (!status.ok()) {
@@ -1979,8 +2171,8 @@ void EnqueueTensorBroadcast(OpKernelContext* context, const Tensor& tensor,
 
   int rank;
   // MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  MPI_Comm_rank(horovod_global[group].comm, &rank);
-
+  MPI_Comm_rank(horovod_global.array[group].comm, &rank);
+  // fprintf(stderr, "rank %d enqueue bcast group %d\n", horovod_global.array[group].global_rank, group);
   MPIRequest message;
   message.set_request_rank(rank);
   message.set_tensor_name(name);
@@ -2003,9 +2195,10 @@ void EnqueueTensorBroadcast(OpKernelContext* context, const Tensor& tensor,
   e.callback = callback;
   e.group = group;
 
-  std::lock_guard<std::mutex> guard(horovod_global[group].mutex);
-  horovod_global[group].tensor_table.emplace(name, std::move(e));
-  horovod_global[group].message_queue.push(message);
+  std::lock_guard<std::mutex> guard(horovod_global.array[group].mutex);
+  horovod_global.array[group].tensor_table.emplace(name, std::move(e));
+  horovod_global.array[group].message_queue.push(message);
+  // fprintf(stderr, "Rank %d bcast enqueue finished (group %d)\n", horovod_global.array[group].global_rank, group);
 }
 
 int GetDeviceID(OpKernelContext* context) {
@@ -2163,7 +2356,7 @@ public:
     auto device = GetDeviceID(context);
     auto tensor = context->input(0);
     Tensor* output = nullptr;
-    if (horovod_global[group_].rank == root_rank_) {
+    if (horovod_global.array[group_].rank == root_rank_) {
       context->set_output(0, tensor);
     } else {
       OP_REQUIRES_OK(context,
@@ -2234,7 +2427,7 @@ public:
     //(since size is not yet known).
     //Also don't need "output" parameter going to EnqueueTensorGather
     //since no preallocation is happening. 
-    if (horovod_global[group_].rank != root_rank_) {
+    if (horovod_global.array[group_].rank != root_rank_) {
       context->set_output(0, tensor);//Non root ranks just get the
 				     //same tensor as output
     }

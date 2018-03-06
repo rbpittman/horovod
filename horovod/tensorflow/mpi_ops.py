@@ -77,7 +77,8 @@ MPI_LIB = _load_library('mpi_lib' + _get_ext_suffix(),
 MPI_LIB_CTYPES = _load_ctypes_dll('mpi_lib' + _get_ext_suffix())
 
 
-def init(group=-1, group_ranks=None):
+#Pre: group_ranks is 2d list of all groups for horovod
+def init(group_ranks):
     """A function which initializes Horovod.
     Defaults to using 1 group. If group is specified, then it is used as the group index,
     and group_ranks should all be specified. 
@@ -85,19 +86,30 @@ def init(group=-1, group_ranks=None):
     WARNING: Very limited error checking on multiple init specifications. Don't
              provide incorrect input...
     """
-    if group != -1 and group_ranks == None:
+    # if group != -1 and group_ranks == None:
         #Invalid parameters
-        raise ValueError("Invalid parameters sent to init, must specify group_ranks")
-    if group == -1:
-        num_group_ranks = 0
-    else:
-        num_group_ranks = len(group_ranks)
-    array_type = ctypes.c_int * num_group_ranks
-    return MPI_LIB_CTYPES.horovod_tensorflow_init(ctypes.c_int(group),
-                                                  ctypes.c_int(num_group_ranks),
-                                                  array_type(*group_ranks))
+        # raise ValueError("Invalid parameters sent to init, must specify group_ranks")
+    # if group == -1:
+    #     num_group_ranks = 0
+    # else:
+    #     num_group_ranks = len(group_ranks)
+    
+    #Create group lens list
+    group_lens = [len(group) for group in group_ranks]
+    group_lens_fn = ctypes.c_int * len(group_lens)
+    
+    #Create concatenated group ranks list
+    concat_ranks = list(group_ranks[0])
+    for i in range(1, len(group_ranks)):
+        concat_ranks += group_ranks[i]
+    concat_ranks_fn = ctypes.c_int * len(concat_ranks)
+    
+    # array_type = ctypes.c_int * num_group_ranks
+    return MPI_LIB_CTYPES.horovod_tensorflow_init(ctypes.c_int(len(group_ranks)),
+                                                  group_lens_fn(*group_lens),
+                                                  concat_ranks_fn(*concat_ranks))
 
-def size(group=-1):
+def size(group):
     """A function which returns the number of Horovod processes.
 
     Returns:
@@ -136,7 +148,7 @@ def local_size():
     return local_size
 
 
-def rank(group=-1):
+def rank(group):
     """A function which returns the Horovod rank of the calling process.
 
     Returns:
@@ -181,7 +193,7 @@ def _normalize_name(name):
     return re.sub('[^a-zA-Z0-9_]', '_', name)
 
 
-def _allreduce(tensor, name=None, group=-1):
+def _allreduce(tensor, group, name=None):
     """An op which sums an input tensor over all the Horovod processes.
 
     The reduction operation is keyed by the name of the op. The tensor type and
@@ -200,7 +212,7 @@ def _allreduce(tensor, name=None, group=-1):
 ops.NotDifferentiable('HorovodAllreduce')
 
 
-def allgather(tensor, name=None, group=-1):
+def allgather(tensor, group, name=None):
     """An op which concatenates the input tensor with the same input tensor on
     all other Horovod processes.
 
@@ -218,11 +230,9 @@ def allgather(tensor, name=None, group=-1):
         name = 'HorovodAllgather_%s' % _normalize_name(tensor.name)
     return MPI_LIB.horovod_allgather(tensor, name=name, group=group)
 
-
 ops.NotDifferentiable('HorovodAllgather')
 
-
-def broadcast(tensor, root_rank, name=None, group=-1):
+def broadcast(tensor, root_rank, group, name=None):
     """An op which broadcasts the input tensor on root rank to the same input tensor
     on all other Horovod processes.
 
@@ -238,10 +248,9 @@ def broadcast(tensor, root_rank, name=None, group=-1):
         name = 'HorovodBroadcast_%s' % _normalize_name(tensor.name)
     return MPI_LIB.horovod_broadcast(tensor, name=name, root_rank=root_rank, group=group)
 
-
 ops.NotDifferentiable('HorovodBroadcast')
 
-def gather(tensor, root_rank, name=None, group=-1):
+def gather(tensor, root_rank, group, name=None):
     """An op which concatenates the input tensor with the same input tensor on
     all other Horovod processes, and sends the result to root_rank only. 
     
