@@ -1339,9 +1339,11 @@ void PerformOperation(TensorTable& tensor_table, MPIResponse response, HorovodGl
     }
 
     ACTIVITY_START_ALL(entries, timeline, "MPI_BCAST")
+    MPI_Request request;
     MPI_CHECK(entries, "MPI_Bcast",
-              MPI_Bcast(data_ptr, (int)e.tensor.NumElements(), dtype,
-                        e.root_rank, state.comm))
+              MPI_Ibcast(data_ptr, (int)e.tensor.NumElements(), dtype,
+			 e.root_rank, state.comm, &request))
+    MPI_Wait(&request, MPI_STATUS_IGNORE);
     ACTIVITY_END_ALL(entries, timeline)
 
     timeline.End(e.tensor_name, e.output);
@@ -1764,13 +1766,20 @@ void init_state(HorovodGlobalState & state, int num_ranks, int * group_ranks) {
   // MPI_Group_size(world_group, &world_group_size);
   // fprintf(stderr, "World group size for rank %d:%d\n", global_rank, world_group_size);
   //get world group
-  MPI_Group world_group;
-  MPI_Comm_group(MPI_COMM_WORLD, &world_group);
-
-  MPI_Group subgroup;
-  MPI_Group_incl(world_group, num_ranks, group_ranks, &subgroup);
+  
   MPI_Comm subcomm;
-  MPI_Comm_create(MPI_COMM_WORLD, subgroup, &subcomm);
+  //If the requested number of ranks is equal to the number of ranks in total, then just use MPI_COMM_WORLD
+  if(num_ranks == global_size) {
+    MPI_Comm_dup(MPI_COMM_WORLD, &subcomm);
+  } else {
+    MPI_Group world_group;
+    MPI_Comm_group(MPI_COMM_WORLD, &world_group);
+    
+    MPI_Group subgroup;
+    MPI_Group_incl(world_group, num_ranks, group_ranks, &subgroup);
+    // MPI_Comm subcomm;
+    MPI_Comm_create(MPI_COMM_WORLD, subgroup, &subcomm);
+  }
   // fprintf(stderr, "HERE3 call %d\n", call);
   
   int subsize = -1;
