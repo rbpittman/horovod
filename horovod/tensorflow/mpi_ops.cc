@@ -234,7 +234,12 @@ struct HorovodGlobalState {
 struct HorovodGlobal {
   std::vector<int> members;
   HorovodGlobalState * array = NULL;
+  // std::mutex decon_lock;
+  // unsigned int num_arrived = 0;
   ~HorovodGlobal() {
+    // std::lock_guard<std::mutex> guard(decon_lock);
+    // num_arrived++;
+    // if((num_arrived == members.size()) && (array != NULL)) {
     if(array != NULL) {
       delete[] array;
     }
